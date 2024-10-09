@@ -82,6 +82,9 @@ def get_reports(app_id: str):
     If few last calls failed, then try to get reports also from other than default ports.
     """
     data = ensure_minimal_data({"app_id": app_id})
+    data["blender_version"] = (
+        f"{bpy.app.version[0]}.{bpy.app.version[1]}.{bpy.app.version[2]}"
+    )
     if (
         global_vars.CLIENT_FAILED_REPORTS < 10
     ):  # on 10, there is second BlenderKit-Client start
@@ -531,12 +534,43 @@ def handle_client_status_task(task):
     global_vars.CLIENT_RUNNING = True
 
 
-def check_blenderkit_client_exit_code() -> tuple[int, str]:
+def check_blenderkit_client_return_code() -> tuple[int, str]:
+    """Check the return code for the started BlenderKit-Client. If the return code is None, it means Client still runs - we consider this a success!
+    However if the return code is present, it failed to start and we check the return code value. If the return code is known,
+    we print information to user about the reason. So they do not need to dig in the Client log.
+    """
+    # Return codes - as defined in main.go
+    rcServerStartOtherError = 40
+    rcServerStartOtherNetworkingError = 41
+    rcServerStartOtherSyscallError = 42
+    rcServerStartSyscallEADDRINUSE = 43
+    rcServerStartSyscallEACCES = 44
+
     exit_code = global_vars.client_process.poll()
     if exit_code is None:
         return exit_code, "BlenderKit-Client process is running."
 
-    message = f"BlenderKit-Client process exited with code {exit_code}. Please report a bug and paste content of log {get_client_log_path()}"
+    if exit_code == rcServerStartOtherError:
+        msg = f"Other starting problem."
+    if exit_code == rcServerStartOtherNetworkingError:
+        msg = f"Other networking problem."
+    if exit_code == rcServerStartOtherSyscallError:
+        msg = f"Other syscall error."
+
+    if exit_code == rcServerStartSyscallEADDRINUSE:  # This is known solution
+        return (
+            exit_code,
+            "Address already in use: please change the port in add-on preferences.",
+        )
+    if exit_code == rcServerStartSyscallEACCES:  # This needs verification
+        return (
+            exit_code,
+            "Access denied: change port in preferences, check permissions and antivirus rights.",
+        )
+
+    message = (
+        f"{msg} Please report a bug and paste content of log {get_client_log_path()}"
+    )
     return exit_code, message
 
 
@@ -573,6 +607,10 @@ def start_blenderkit_client():
                     global_vars.PREFS.get("ssl_context", ""),
                     "--version",
                     f"{global_vars.VERSION[0]}.{global_vars.VERSION[1]}.{global_vars.VERSION[2]}.{global_vars.VERSION[3]}",
+                    "--software",
+                    "Blender",
+                    "--pid",
+                    str(os.getpid()),
                 ],
                 stdout=log,
                 stderr=log,

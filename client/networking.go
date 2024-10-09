@@ -21,6 +21,9 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,10 +32,28 @@ import (
 	"github.com/rapid7/go-get-proxied/proxy"
 )
 
-func DebugNetworkHandler(w http.ResponseWriter, r *http.Request) {
-	text := "Network Debug not implemented now."
-	w.Write([]byte(text))
-	w.WriteHeader(http.StatusOK)
+// Handler for the index of the Client.
+// In future we can add here links to /debug or other useful endpoints.
+func indexHandler(w http.ResponseWriter, r *http.Request) {
+	pid := os.Getpid()
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w, `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>BlenderKit-Client</title>
+</head>
+<body>
+	<h1>BlenderKit-Client</h1>
+	<div>Client PID: %d</div>
+	<div>Client Version: v%s</div>
+	<div>Platform: %s</div>
+	<div>System ID: %s</div>
+	<div>Started from %s add-on: v%s</div>
+</body>
+</html>`, pid, ClientVersion, GetPlatformVersion(), *SystemID, *StartingSoftwareName, *StartingAddonVersion)
 }
 
 // CreateHTTPClients creates HTTP clients with proxy settings, assings them to global variables.
@@ -42,44 +63,23 @@ func CreateHTTPClients(proxyURL, proxyWhich, sslContext, trustedCACerts string) 
 	tlsConfig := GetTLSConfig(sslContext)
 	tlsConfig.RootCAs = GetCACertPool(trustedCACerts)
 
-	tAPI := http.DefaultTransport.(*http.Transport).Clone()
-	tAPI.TLSClientConfig = tlsConfig
-	tAPI.Proxy = proxy
-	ClientAPI = &http.Client{
-		Transport: tAPI,
-		Timeout:   time.Minute,
-	}
+	ClientAPI = GetHTTPClient(nil, tlsConfig, proxy, time.Minute)
+	ClientDownloads = GetHTTPClient(nil, tlsConfig, proxy, 1*time.Hour)
+	ClientUploads = GetHTTPClient(nil, tlsConfig, proxy, 24*time.Hour)
+	ClientBigThumbs = GetHTTPClient(nil, tlsConfig, proxy, time.Minute)
+	ClientSmallThumbs = GetHTTPClient(nil, tlsConfig, proxy, time.Minute)
+}
 
-	tDownloads := http.DefaultTransport.(*http.Transport).Clone()
-	tDownloads.TLSClientConfig = tlsConfig
-	tDownloads.Proxy = proxy
-	ClientDownloads = &http.Client{
-		Transport: tDownloads,
-		Timeout:   1 * time.Hour,
+func GetHTTPClient(transport *http.Transport, tlsConfig *tls.Config, proxy func(*http.Request) (*url.URL, error), timeout time.Duration) *http.Client {
+	if transport == nil {
+		transport = http.DefaultTransport.(*http.Transport).Clone()
 	}
+	transport.TLSClientConfig = tlsConfig
+	transport.Proxy = proxy
 
-	tUploads := http.DefaultTransport.(*http.Transport).Clone()
-	tUploads.TLSClientConfig = tlsConfig
-	tUploads.Proxy = proxy
-	ClientUploads = &http.Client{
-		Transport: tUploads,
-		Timeout:   24 * time.Hour,
-	}
-
-	tBigThumbs := http.DefaultTransport.(*http.Transport).Clone()
-	tBigThumbs.TLSClientConfig = tlsConfig
-	tBigThumbs.Proxy = proxy
-	ClientBigThumbs = &http.Client{
-		Transport: tBigThumbs,
-		Timeout:   time.Minute,
-	}
-
-	tSmallThumbs := http.DefaultTransport.(*http.Transport).Clone()
-	tSmallThumbs.TLSClientConfig = tlsConfig
-	tSmallThumbs.Proxy = proxy
-	ClientSmallThumbs = &http.Client{
-		Transport: tSmallThumbs,
-		Timeout:   time.Minute,
+	return &http.Client{
+		Transport: http.DefaultTransport,
+		Timeout:   timeout,
 	}
 }
 
@@ -148,4 +148,165 @@ func GetCACertPool(caFilePath string) *x509.CertPool {
 	BKLog.Printf("%s Loaded CA certificate from file: %v", EmoOK, caFilePath)
 	caCertPool.AppendCertsFromPEM(caCert)
 	return caCertPool
+}
+
+func GetIP() (string, error) {
+	resp, err := http.Get("https://api.ipify.org?format=json")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var ip struct {
+		IP string `json:"ip"`
+	}
+
+	err = json.NewDecoder(resp.Body).Decode(&ip)
+	if err != nil {
+		return "127.0.0.1", err
+	}
+	return ip.IP, nil
+}
+
+var sslOptions = []string{
+	"ENABLED",
+	"DISABLED",
+}
+
+var proxyOptions = []string{
+	"SYSTEM",
+	"NONE",
+}
+
+var TimeoutCoefficient = []int{1, 10}
+
+var testURLs = []string{
+	"https://www.blenderkit.com/api/v1/search/?query=kitten",
+	"https://api.blenderkit.com/api/v1/search/?query=kitten",
+	"https://public.blenderkit.com/robots.txt",
+	"https://status.blenderkit.com/",
+	"https://www.blenderkit.com/disclaimer/",
+}
+
+func DebugNetworkHandler(w http.ResponseWriter, r *http.Request) {
+	report := NetworkDebug()
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte(report))
+}
+
+func NetworkDebug() string {
+	report := fmt.Sprintf("NETWORK DEBUG REPORT\nPlatform: %s\nClientVersion: %s\nSystemID %s\n", GetPlatformVersion(), ClientVersion, *getSystemID())
+	BKLog.Printf("%s Network debug has started", EmoDebug)
+
+	ip, err := GetIP()
+	if err != nil {
+		fmt.Println(err)
+		return fmt.Sprintf("Error getting client's IP: %v", err)
+	}
+	BKLog.Printf("%s Client's IP: %s", EmoDebug, ip)
+	report += fmt.Sprintf("Client's IP: %s\n", ip)
+	report += "-----------------------------------\n\n"
+
+	for tCoefficient := range TimeoutCoefficient {
+		tq := time.Duration(TimeoutCoefficient[tCoefficient])
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.IdleConnTimeout = 90 * time.Second * tq
+		transport.TLSHandshakeTimeout = 10 * time.Second * tq
+		transport.ExpectContinueTimeout = 1 * time.Second * tq
+		transport.DialContext = (&net.Dialer{
+			Timeout:   30 * time.Second * tq,
+			KeepAlive: 30 * time.Second * tq,
+		}).DialContext
+
+		for sslOption := range sslOptions {
+			tlsConfig := GetTLSConfig(sslOptions[sslOption])
+
+			for proxyOption := range proxyOptions {
+				proxy := GetProxyFunc("", proxyOptions[proxyOption])
+				timeout := time.Duration(1 * time.Minute * tq)
+				client := GetHTTPClient(transport, tlsConfig, proxy, timeout)
+
+				for i := range fakeHeaders {
+					headers := fakeHeaders[i]
+					for x := range testURLs {
+						report += DebugRequest(client, testURLs[x], headers, TimeoutCoefficient[tCoefficient], sslOptions[sslOption], proxyOptions[proxyOption])
+					}
+				}
+			}
+		}
+	}
+
+	return report
+}
+
+func DebugRequest(client *http.Client, url string, headers [][]string, tCoeff int, sslOption string, proxyOption string) string {
+	report := fmt.Sprintf("=== DEBUG REQUEST\nurl=%s, \ntimeCoef=%d, \nsslOption=\"%s\", \nproxyOption=\"%s\", \nheaders=\"%s\"\n", url, tCoeff, sslOption, proxyOption, headers)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		msg := fmt.Sprintf("Error creating request: %v", err)
+		return report + msg
+	}
+
+	platformVersion := GetPlatformVersion()
+	req.Header = getHeaders("", *SystemID, *StartingAddonVersion, platformVersion)
+
+	for i := range headers {
+		if len(headers[i]) < 2 {
+			continue
+		}
+		req.Header.Set(headers[i][0], headers[i][1])
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		msg := fmt.Sprintf("--> Error doing request: %v\n\n", err)
+		return report + msg
+	}
+	defer resp.Body.Close()
+
+	BKLog.Printf("%s %s\nurl=%s\ntimeQ=%v\nsslOption=%s,\nproxyOption=%s,\nheaders=%s\n\n",
+		EmoDebug,
+		resp.Status,
+		url,
+		tCoeff,
+		sslOption,
+		proxyOption,
+		req.Header,
+	)
+
+	report += fmt.Sprintf("--> %s\n\n", resp.Status)
+
+	return report
+}
+
+var fakeHeaders = [][][]string{
+	{{}},
+	{
+		{"User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"},
+	},
+	{
+		{"User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"},
+	},
+	{
+		{"Host", "www.blenderkit.com"},
+		{"User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Gecko/20100101 Firefox/128.0"},
+		{"Accept", "*/*"},
+		{"Accept-Language", "en-US,en;q=0.5"},
+		{"Accept-Encoding", "gzip, deflate, br, zstd"},
+		{"Referer", "https://www.blenderkit.com/asset-gallery?query=category_subtree:model%20order:-created"},
+		{"Sec-Fetch-Dest", "empty"},
+		{"Sec-Fetch-Mode", "cors"},
+		{"Sec-Fetch-Site", "same-origin"},
+		{"Connection", "keep-alive"},
+	},
+	{
+		{"Accept", "application/json"},
+		{"Accept-Encoding", "gzip, deflate"},
+		{"Accept-Language", "en-US,en;q=0.5"},
+		{"Host", "www.blenderkit.com"},
+		{"Priority", "u=0"},
+		{"Referer", "http://httpbin.org/"},
+		{"User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Gecko/20100101 Firefox/128.0"},
+		{"X-Amzn-Trace-Id", "Root=1-669e49f6-6a223d0b7b77e869286d13fe"},
+	},
 }

@@ -31,8 +31,8 @@ import bpy
 from mathutils import Vector
 
 from . import (
-    daemon_lib,
-    daemon_tasks,
+    client_lib,
+    client_tasks,
     global_vars,
     image_utils,
     paths,
@@ -438,7 +438,7 @@ def get_preferences_as_dict():
         "tips_on_start": user_preferences.tips_on_start,
         "announcements_on_start": user_preferences.announcements_on_start,
         # NETWORK
-        "daemon_port": user_preferences.daemon_port,
+        "client_port": user_preferences.client_port,
         "ip_version": user_preferences.ip_version,
         "ssl_context": user_preferences.ssl_context,
         "proxy_which": user_preferences.proxy_which,
@@ -484,7 +484,7 @@ def api_key_property_updated(user_preferences, context):
     """
     if len(user_preferences.api_key) >= 25:
         if user_preferences.preferences_lock == False:
-            daemon_lib.get_user_profile()
+            client_lib.get_user_profile()
         search.refresh_search()
         return save_prefs(user_preferences, context)
 
@@ -1277,7 +1277,7 @@ def is_upload_old(asset_data):
     return 0
 
 
-def handle_nonblocking_request_task(task: daemon_tasks.Task):
+def handle_nonblocking_request_task(task: client_tasks.Task):
     if task.status == "finished":
         reports.add_report(task.message)
     if task.status == "error":

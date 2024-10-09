@@ -19,7 +19,7 @@
 bl_info = {
     "name": "BlenderKit Online Asset Library",
     "author": "Vilem Duha, Petr Dlouhy, A. Gajdosik",
-    "version": (3, 12, 3, 240801),  # X.Y.Z.yymmdd
+    "version": (3, 13, 0, 240927),  # X.Y.Z.yymmdd
     "blender": (3, 0, 0),
     "location": "View3D > Properties > BlenderKit",
     "description": "Boost your workflow with drag&drop assets from the community driven library.",
@@ -27,7 +27,7 @@ bl_info = {
     "tracker_url": "https://github.com/BlenderKit/blenderkit/issues",
     "category": "3D View",
 }
-VERSION = (3, 12, 3, 240801)
+VERSION = (3, 13, 0, 240927)
 
 import logging
 import sys
@@ -75,8 +75,8 @@ if "bpy" in locals():
     bkit_oauth = reload(bkit_oauth)
     categories = reload(categories)
     colors = reload(colors)
-    daemon_lib = reload(daemon_lib)
-    daemon_tasks = reload(daemon_tasks)
+    client_lib = reload(client_lib)
+    client_tasks = reload(client_tasks)
     disclaimer_op = reload(disclaimer_op)
     download = reload(download)
     icons = reload(icons)
@@ -126,8 +126,8 @@ else:
     from . import bkit_oauth
     from . import categories
     from . import colors
-    from . import daemon_lib
-    from . import daemon_tasks
+    from . import client_lib
+    from . import client_tasks
     from . import disclaimer_op
     from . import download
     from . import icons
@@ -507,7 +507,7 @@ class BlenderKitUIProps(PropertyGroup):
     drag_init_button: BoolProperty(
         name="Drag Initialisation from button",
         default=False,
-        description="Click or drag into scene for download",
+        description="Click or drag into scene for download.\nUse mouse wheel during drag to rotate the asset. Cancel the drag by pressing 'Esc'.",
         update=run_drag_drop_update,
     )
     drag_length: IntProperty(name="Drag length", default=0)
@@ -2013,7 +2013,7 @@ class BlenderKitAddonPreferences(AddonPreferences):
         update=fix_subdir,
     )
 
-    daemon_port: EnumProperty(
+    client_port: EnumProperty(
         name="Client port",
         description="Port to be used for startup and communication with BlenderKit-Client. Changing the port will cancel all running downloads and searches",
         items=(
@@ -2027,7 +2027,7 @@ class BlenderKitAddonPreferences(AddonPreferences):
             ("1234", "1234", ""),
         ),
         default="62485",
-        update=timer.save_prefs_cancel_all_tasks_and_restart_daemon,
+        update=timer.save_prefs_cancel_all_tasks_and_restart_client,
     )
 
     unpack_files: BoolProperty(
@@ -2074,7 +2074,7 @@ class BlenderKitAddonPreferences(AddonPreferences):
         ),
         description="Which address family add-on should use for connection",
         default="BOTH",
-        update=timer.save_prefs_cancel_all_tasks_and_restart_daemon,
+        update=timer.save_prefs_cancel_all_tasks_and_restart_client,
     )
 
     ssl_context: EnumProperty(
@@ -2093,7 +2093,7 @@ class BlenderKitAddonPreferences(AddonPreferences):
         ),
         description="Secure communication between BlenderKit-client and blenderkit.com server by SSL",
         default="ENABLED",
-        update=timer.save_prefs_cancel_all_tasks_and_restart_daemon,
+        update=timer.save_prefs_cancel_all_tasks_and_restart_client,
     )
 
     proxy_which: EnumProperty(
@@ -2128,7 +2128,7 @@ class BlenderKitAddonPreferences(AddonPreferences):
         ),
         description="Configure proxy settings for all outgoing HTTPS requests",
         default="SYSTEM",
-        update=timer.save_prefs_cancel_all_tasks_and_restart_daemon,
+        update=timer.save_prefs_cancel_all_tasks_and_restart_client,
     )
 
     proxy_address: StringProperty(
@@ -2140,7 +2140,7 @@ If you use simple HTTP proxy, set in format http://ip:port, or http://username:p
 HTTPS proxies are not supported! We wait for support in Python 3.11 and in aiohttp module. You can specify the HTTPS proxy with https:// prefix for hacking around and development purposes, but functionality cannot be guaranteed.
 In this case you should also set path to your system CA bundle containing proxy's certificates in the field "Custom CA certificates path" below""",
         default="",
-        update=timer.save_prefs_cancel_all_tasks_and_restart_daemon,
+        update=timer.save_prefs_cancel_all_tasks_and_restart_client,
     )
 
     trusted_ca_certs: StringProperty(
@@ -2353,7 +2353,7 @@ In this case you should also set path to your system CA bundle containing proxy'
         network_settings = layout.box()
         network_settings.alignment = "EXPAND"
         network_settings.label(text="Networking settings")
-        network_settings.prop(self, "daemon_port")
+        network_settings.prop(self, "client_port")
         network_settings.prop(self, "ip_version")
         network_settings.prop(self, "ssl_context")
         network_settings.prop(self, "proxy_which")
@@ -2365,20 +2365,36 @@ In this case you should also set path to your system CA bundle containing proxy'
         addon_updater_ops.update_settings_ui(self, context)
 
         # RUNTIME INFO
-        addondir_row = layout.row()
-        addondir_row.label(text=f"Installed at: {path.dirname(__file__)}")
-        addondir_row.enabled = False
-        globdir_row = layout.row()
-        globdir_row.label(text=f"Global directory: {self.global_dir}")
-        globdir_row.enabled = False
-        dlog_row = layout.row()
-        dlog_row.label(
-            text=f"BlenderKit-client log: {daemon_lib.get_client_log_path()}"
+        globdir_op = layout.operator(
+            "wm.blenderkit_open_global_directory",
+            text=f"Global directory: {self.global_dir}",
+            icon="FILE_FOLDER",
         )
-        dlog_row.enabled = False
-        tmpdir_row = layout.row()
-        tmpdir_row.label(text=f"Temp directory: {paths.get_temp_dir()}")
-        tmpdir_row.enabled = False
+        globdir_op.directory = self.global_dir
+
+        clientlog_path = client_lib.get_client_log_path()
+        clientlog_op = layout.operator(
+            "wm.blenderkit_open_client_log",
+            text=f"Client log: {clientlog_path}",
+            icon="FILE_FOLDER",
+        )
+        clientlog_op.directory = clientlog_path
+
+        addondir = path.dirname(__file__)
+        addondir_op = layout.operator(
+            "wm.blenderkit_open_addon_directory",
+            text=f"Installed at: {addondir}",
+            icon="FILE_FOLDER",
+        )
+        addondir_op.directory = addondir
+
+        tempdir = paths.get_temp_dir()
+        tempdir_op = layout.operator(
+            "wm.blenderkit_open_temp_directory",
+            text=f"Temp directory: {tempdir}",
+            icon="FILE_FOLDER",
+        )
+        tempdir_op.directory = tempdir
 
 
 # registration
@@ -2466,7 +2482,7 @@ def register():
     if bpy.app.factory_startup is False:
         user_preferences = bpy.context.preferences.addons[__package__].preferences
         global_vars.PREFS = utils.get_preferences_as_dict()
-        daemon_lib.reorder_ports(user_preferences.daemon_port)
+        client_lib.reorder_ports(user_preferences.client_port)
         timer.update_trusted_CA_certs(user_preferences.trusted_ca_certs)
 
     search.register_search()
@@ -2530,7 +2546,7 @@ def unregister():
 
     if bpy.app.background is False:
         try:
-            daemon_lib.unsubscribe_addon()
+            client_lib.unsubscribe_addon()
             bk_logger.info("Reported Blender quit to Client.")
         except Exception as e:
             bk_logger.error(e)

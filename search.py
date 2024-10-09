@@ -20,7 +20,7 @@ import json
 import logging
 import math
 import os
-import platform
+import urllib.parse
 import unicodedata
 
 import bpy
@@ -33,8 +33,9 @@ from bpy.types import Operator
 
 from . import (
     asset_bar_op,
-    daemon_lib,
-    daemon_tasks,
+    client_lib,
+    client_tasks,
+    comments_utils,
     global_vars,
     image_utils,
     paths,
@@ -321,7 +322,7 @@ def cleanup_search_results():
     clear_searches()
 
 
-def handle_search_task_error(task: daemon_tasks.Task) -> None:
+def handle_search_task_error(task: client_tasks.Task) -> None:
     """Handle incomming search task error."""
     if len(search_tasks) == 0:
         props = utils.get_search_props()
@@ -329,7 +330,7 @@ def handle_search_task_error(task: daemon_tasks.Task) -> None:
     return reports.add_report(task.message, 5, "ERROR")
 
 
-def handle_search_task(task: daemon_tasks.Task) -> bool:
+def handle_search_task(task: client_tasks.Task) -> bool:
     """Parse search results, try to load all available previews."""
     global search_tasks
     if len(search_tasks) == 0:
@@ -380,8 +381,18 @@ def handle_search_task(task: daemon_tasks.Task) -> bool:
         asset_data = parse_result(r)
         if asset_data is not None:
             result_field.append(asset_data)
+        # fetch all comments if user is validator to preview them faster
+        # these comments are also shown as part of the tooltip oh mouse hover in asset bar.
+        if utils.profile_is_validator():
+            comments = comments_utils.get_comments_local(asset_data["assetBaseId"])
+            if comments is None:
+                user_preferences = bpy.context.preferences.addons[
+                    __package__
+                ].preferences
+                api_key = user_preferences.api_key
+                client_lib.get_comments(asset_data["assetBaseId"])
 
-    # Get ratings from BlenderKit server TODO: do this in daemon
+    # Get ratings from BlenderKit server TODO: do this in client
     if utils.profile_is_validator():
         for result in task.result["results"]:
             ratings_utils.ensure_rating(result["id"])
@@ -425,7 +436,7 @@ def handle_search_task(task: daemon_tasks.Task) -> bool:
     return True
 
 
-def handle_thumbnail_download_task(task: daemon_tasks.Task) -> None:
+def handle_thumbnail_download_task(task: client_tasks.Task) -> None:
     if task.status == "finished":
         global_vars.DATA["images available"][task.data["image_path"]] = True
     elif task.status == "error":
@@ -611,7 +622,7 @@ def generate_author_textblock(adata):
     return t
 
 
-def handle_fetch_gravatar_task(task: daemon_tasks.Task):
+def handle_fetch_gravatar_task(task: client_tasks.Task):
     """Handle incomming fetch_gravatar_task which contains path to author's image on the disk."""
     if task.status == "finished":
         author_id = str(task.data["id"])
@@ -625,13 +636,13 @@ def generate_author_profile(author_data):
     author_id = str(author_data["id"])
     if author_id in global_vars.DATA["bkit authors"]:
         return
-    daemon_lib.download_gravatar_image(author_data)
+    client_lib.download_gravatar_image(author_data)
     author_data["tooltip"] = generate_author_textblock(author_data)
     global_vars.DATA["bkit authors"][author_id] = author_data
     return
 
 
-def handle_get_user_profile(task: daemon_tasks.Task):
+def handle_get_user_profile(task: client_tasks.Task):
     """Handle incomming get_user_profile task which contains data about current logged-in user."""
     if task.status == "finished":
         user_data = task.result
@@ -641,25 +652,27 @@ def handle_get_user_profile(task: daemon_tasks.Task):
             "user"
         ]
         # after profile arrives, we can check for gravatar image
-        daemon_lib.download_gravatar_image(user_data["user"])
+        client_lib.download_gravatar_image(user_data["user"])
         if user_data.get("canEditAllAssets", False):  # IS VALIDATOR
             utils.enforce_prerelease_update_check()
 
 
 def query_to_url(query={}, params={}):
-    # build a new request
+    """Build a new search request by parsing query dictionaty into appropriate URL.
+    Also modifies query and params and adds some stuff in there which is very misleading anti-patter.
+    TODO: just convert to URL here and move the sorting and adding of params to separate function.
+    https://www.blenderkit.com/api/v1/search/
+    """
     url = f"{paths.BLENDERKIT_API}/search/"
 
-    # build request manually
-    # TODO use real queries
     requeststring = "?query="
-    #
     if query.get("query") not in ("", None):
-        requeststring += query["query"]  # .lower()
-    for i, q in enumerate(query):
+        requeststring += urllib.parse.quote_plus(query["query"])  # .lower()
+    for q in query:
         if q != "query" and q != "free_first":
-            requeststring += "+"
-            requeststring += q + ":" + str(query[q])  # .lower()
+            requeststring += (
+                f"+{q}:{urllib.parse.quote_plus(str(query[q]))}"  # .lower()
+            )
 
     # add dict_parameters to make results smaller
     # result ordering: _score - relevance, score - BlenderKit score
@@ -700,11 +713,12 @@ def query_to_url(query={}, params={}):
     requeststring += "&dict_parameters=1"
 
     requeststring += "&page_size=" + str(params["page_size"])
-    requeststring += "&addon_version=%s" % params["addon_version"]
+    requeststring += f"&addon_version={params['addon_version']}"
     if not (query.get("query") and query.get("query").find("asset_base_id") > -1):
-        requeststring += "&blender_version=%s" % params["blender_version"]
+        requeststring += f"&blender_version={params['blender_version']}"
     if params.get("scene_uuid") is not None:
-        requeststring += "&scene_uuid=%s" % params["scene_uuid"]
+        requeststring += f"&scene_uuid={params['scene_uuid']}"
+
     urlquery = url + requeststring
     return urlquery
 
@@ -895,7 +909,7 @@ def add_search_process(query, params):
         "asset_type": query["asset_type"],
     }
     data.update(params)
-    response = daemon_lib.asset_search(data)
+    response = client_lib.asset_search(data)
     search_tasks[response["task_id"]] = data
 
 
@@ -926,7 +940,7 @@ def get_search_simple(
     requeststring += "&dict_parameters=1"
 
     bk_logger.debug(requeststring)
-    response = daemon_lib.blocking_request(requeststring, "GET", headers)
+    response = client_lib.blocking_request(requeststring, "GET", headers)
 
     # print(response.json())
     search_results = response.json()
@@ -937,7 +951,7 @@ def get_search_simple(
     page_count = math.ceil(search_results["count"] / page_size)
     while search_results.get("next") and len(results) < max_results:
         bk_logger.info(f"getting page {page_index} , total pages {page_count}")
-        response = daemon_lib.blocking_request(search_results["next"], "GET", headers)
+        response = client_lib.blocking_request(search_results["next"], "GET", headers)
         search_results = response.json()
         results.extend(search_results["results"])
         page_index += 1
@@ -1090,10 +1104,12 @@ def clean_filters():
 
 
 def update_filters():
-    # update filters for 2 reasons
-    # - first to show if filters are active
-    # - second to show login popup if user needs to log in
-    # returns True if search should proceed, False to bounce search(like in the case of bookmarks)
+    """Update filters for 2 reasons
+    - first to show if filters are active
+    - second to show login popup if user needs to log in
+
+    returns True if search should proceed, False to bounce search(like in the case of bookmarks)
+    """
 
     sprops = utils.get_search_props()
     ui_props = bpy.context.window_manager.blenderkitUI
@@ -1228,7 +1244,7 @@ def refresh_search():
     if ui_props.assetbar_on:
         ui_props.turn_off = True
         ui_props.assetbar_on = False
-    cleanup_search_results()  # TODO: is it possible to start this from daemon automatically? probably YEA
+    cleanup_search_results()  # TODO: is it possible to start this from Client automatically? probably YEA
     history = global_vars.DATA["search history"]
     if len(history) > 0:
         search(query=history[-1])
@@ -1351,6 +1367,17 @@ class TooltipLabelOperator(Operator):
 
     def execute(self, context):
         return {"FINISHED"}
+
+
+def get_search_similar_keywords(asset_data: dict) -> str:
+    """Generate search similar keywords from the given asset_data.
+    Could be tuned in the future to provide better search results.
+    """
+    keywords = asset_data["name"]
+    if asset_data.get("description"):
+        keywords += f" {asset_data.get('description')} "
+    keywords += " ".join(asset_data.get("tags"))
+    return keywords
 
 
 classes = [SearchOperator, UrlOperator, TooltipLabelOperator]

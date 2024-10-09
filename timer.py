@@ -27,9 +27,9 @@ from . import (
     bg_blender,
     bkit_oauth,
     categories,
+    client_lib,
+    client_tasks,
     comments_utils,
-    daemon_lib,
-    daemon_tasks,
     disclaimer_op,
     download,
     global_vars,
@@ -56,21 +56,21 @@ def handle_failed_reports(exception: Exception) -> float:
     )
     global_vars.CLIENT_ACCESSIBLE = False
     if global_vars.CLIENT_FAILED_REPORTS in (0, 10):
-        daemon_lib.start_blenderkit_client()
+        client_lib.start_blenderkit_client()
 
     global_vars.CLIENT_FAILED_REPORTS += 1
     if global_vars.CLIENT_FAILED_REPORTS < 15:
         return 0.1 * global_vars.CLIENT_FAILED_REPORTS
 
     bk_logger.warning(f"Could not get reports: {exception}")
-    return_code, meaning = daemon_lib.check_blenderkit_client_exit_code()
+    return_code, meaning = client_lib.check_blenderkit_client_return_code()
     if return_code is None and global_vars.CLIENT_FAILED_REPORTS == 15:
         reports.add_report(
             "Client is not responding, add-on will not work.", 10, "ERROR"
         )
     if return_code is not None and global_vars.CLIENT_FAILED_REPORTS == 15:
         reports.add_report(
-            f"Client is not running, add-on will not work. Error({return_code}): {meaning}",
+            f"Client failed to start, add-on will not work. Error({return_code}): {meaning}",
             10,
             "ERROR",
         )
@@ -78,21 +78,21 @@ def handle_failed_reports(exception: Exception) -> float:
     wm = bpy.context.window_manager
     wm.blenderkitUI.logo_status = "logo_offline"
     global_vars.CLIENT_RUNNING = False
-    daemon_lib.start_blenderkit_client()
+    client_lib.start_blenderkit_client()
     return 30.0
 
 
 @bpy.app.handlers.persistent
-def daemon_communication_timer():
-    """Recieve all responses from daemon and run according followup commands.
-    This function is the only one responsible for keeping the daemon up and running.
+def client_communication_timer():
+    """Recieve all responses from Client and run according followup commands.
+    This function is the only one responsible for keeping the Client up and running.
     """
     global pending_tasks
-    bk_logger.debug("Getting tasks from daemon")
+    bk_logger.debug("Getting tasks from Client")
     search.check_clipboard()
     results = list()
     try:
-        results = daemon_lib.get_reports(os.getpid())
+        results = client_lib.get_reports(os.getpid())
         global_vars.CLIENT_FAILED_REPORTS = 0
     except Exception as e:
         return handle_failed_reports(e)
@@ -110,7 +110,7 @@ def daemon_communication_timer():
 
     # convert to task type
     for task in results:
-        task = daemon_tasks.Task(
+        task = client_tasks.Task(
             data=task["data"],
             task_id=task["task_id"],
             app_id=task["app_id"],
@@ -148,27 +148,34 @@ def timer_image_cleanup():
     return 60
 
 
-def save_prefs_cancel_all_tasks_and_restart_daemon(user_preferences, context):
-    """Save preferences, cancel all blenderkit-client tasks and shutdown the blenderkit-client.
-    The daemon_communication_timer will soon take care of starting the daemon again leading to a restart.
+def save_prefs_cancel_all_tasks_and_restart_client(user_preferences, context):
+    """Save preferences, cancel all blenderkit-client tasks, shutdown the blenderkit-client and reorder ports.
+    Unset the CLIENT_FAILED_REPORTS and restart client_communication_timer() so add-on will check for the reports ASAP.
+    Timer func client_communication_timer() will take care of starting the Client and checking the reports.
     """
     utils.save_prefs(user_preferences, context)
     if user_preferences.preferences_lock == True:
         return
 
-    reports.add_report("Restarting client server", 5, "INFO")
-    daemon_lib.reorder_ports(user_preferences.daemon_port)
+    reports.add_report("Restarting Client server", 2, "INFO")
     try:
         cancel_all_tasks(user_preferences, context)
-        daemon_lib.shutdown_client()
+        client_lib.shutdown_client()
     except Exception as e:
         bk_logger.warning(str(e))
+
+    client_lib.reorder_ports(
+        user_preferences.client_port
+    )  # reorder after shutdown was requested
+    global_vars.CLIENT_FAILED_REPORTS = 0  # reset failed reports so next attempt to get report or start client is immediate
+    bpy.app.timers.unregister(client_communication_timer)
+    bpy.app.timers.register(client_communication_timer, persistent=True)
 
 
 def trusted_CA_certs_property_updated(user_preferences, context):
     """Update trusted CA certs environment variables and call save_prefs()."""
     update_trusted_CA_certs(user_preferences.trusted_ca_certs)
-    return save_prefs_cancel_all_tasks_and_restart_daemon(user_preferences, context)
+    return save_prefs_cancel_all_tasks_and_restart_client(user_preferences, context)
 
 
 def update_trusted_CA_certs(certs: str):
@@ -191,14 +198,14 @@ def cancel_all_tasks(self, context):
     # TODO: should add uploads
 
 
-def task_error_overdrive(task: daemon_tasks.Task) -> None:
+def task_error_overdrive(task: client_tasks.Task) -> None:
     """Handle error task - overdrive some error messages, trigger functions common for all errors."""
     if task.message.count("Invalid token.") > 0 and utils.user_logged_in():
         preferences = bpy.context.preferences.addons[__package__].preferences
 
         # Invalid token and api_key_refresh present -> trying to refresh the token
         if preferences.api_key_refresh != "":
-            daemon_lib.refresh_token(preferences.api_key_refresh, preferences.api_key)
+            client_lib.refresh_token(preferences.api_key_refresh, preferences.api_key)
             reports.add_report(
                 "Invalid API key token. Refreshing the token now. If problem persist, please log-out and log-in.",
                 5,
@@ -215,7 +222,7 @@ def task_error_overdrive(task: daemon_tasks.Task) -> None:
         )
 
 
-def handle_task(task: daemon_tasks.Task):
+def handle_task(task: client_tasks.Task):
     """Handle incomming task information. Sort tasks by type and call apropriate functions."""
     if task.status == "error":
         task_error_overdrive(task)
@@ -256,7 +263,7 @@ def handle_task(task: daemon_tasks.Task):
 
     # HANDLE CLIENT STATUS REPORT
     if task.task_type == "client_status":
-        return daemon_lib.handle_client_status_task(task)
+        return client_lib.handle_client_status_task(task)
 
     # HANDLE DISCLAIMER
     if task.task_type == "disclaimer":
@@ -300,8 +307,15 @@ def handle_task(task: daemon_tasks.Task):
     if task.task_type == "wrappers/nonblocking_request":
         return utils.handle_nonblocking_request_task(task)
 
-    # HANDLE MESSAGE FROM DAEMON
-    if task.task_type == "message_from_daemon":
+    # BKCLIENTJS - Download from web
+    if task.task_type == "bkclientjs/get_asset":
+        return download.handle_bkclientjs_get_asset(task)
+
+    # HANDLE MESSAGE FROM CLIENT
+    if (
+        task.task_type == "message_from_daemon"  # TODO: depracate message_from_daemon
+        or task.task_type == "message_from_client"
+    ):
         level = task.result.get("level", "INFO").upper()
         duration = task.result.get("duration", 5)
         destination = task.result.get("destination", "GUI")
@@ -322,8 +336,8 @@ def check_timers_timer():
         bpy.app.timers.register(tasks_queue.queue_worker)
     if not bpy.app.timers.is_registered(bg_blender.bg_update):
         bpy.app.timers.register(bg_blender.bg_update)
-    if not bpy.app.timers.is_registered(daemon_communication_timer):
-        bpy.app.timers.register(daemon_communication_timer, persistent=True)
+    if not bpy.app.timers.is_registered(client_communication_timer):
+        bpy.app.timers.register(client_communication_timer, persistent=True)
     if not bpy.app.timers.is_registered(timer_image_cleanup):
         bpy.app.timers.register(timer_image_cleanup, persistent=True, first_interval=60)
     return 5.0
@@ -338,8 +352,8 @@ def on_startup_timer():
     return None
 
 
-def on_startup_daemon_online_timer():
-    """Run once when daemon is online after startup."""
+def on_startup_client_online_timer():
+    """Run once when Client is online after startup."""
     if not global_vars.CLIENT_RUNNING:
         return 1
 
@@ -369,7 +383,7 @@ def register_timers():
 
     # ONETIMERS
     bpy.app.timers.register(on_startup_timer)
-    bpy.app.timers.register(on_startup_daemon_online_timer, first_interval=1)
+    bpy.app.timers.register(on_startup_client_online_timer, first_interval=1)
     bpy.app.timers.register(disclaimer_op.show_disclaimer_timer, first_interval=1)
 
 
@@ -386,14 +400,14 @@ def unregister_timers():
         bpy.app.timers.unregister(tasks_queue.queue_worker)
     if bpy.app.timers.is_registered(bg_blender.bg_update):
         bpy.app.timers.unregister(bg_blender.bg_update)
-    if bpy.app.timers.is_registered(daemon_communication_timer):
-        bpy.app.timers.unregister(daemon_communication_timer)
+    if bpy.app.timers.is_registered(client_communication_timer):
+        bpy.app.timers.unregister(client_communication_timer)
     if bpy.app.timers.is_registered(timer_image_cleanup):
         bpy.app.timers.unregister(timer_image_cleanup)
 
     if bpy.app.timers.is_registered(on_startup_timer):
         bpy.app.timers.unregister(on_startup_timer)
-    if bpy.app.timers.is_registered(on_startup_daemon_online_timer):
-        bpy.app.timers.unregister(on_startup_daemon_online_timer)
+    if bpy.app.timers.is_registered(on_startup_client_online_timer):
+        bpy.app.timers.unregister(on_startup_client_online_timer)
     if bpy.app.timers.is_registered(disclaimer_op.show_disclaimer_timer):
         bpy.app.timers.unregister(disclaimer_op.show_disclaimer_timer)

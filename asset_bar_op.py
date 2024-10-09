@@ -471,7 +471,7 @@ class BlenderKitAssetBarOperator(BL_UI_OT_draw_operator):
         if (
             user_preferences.asset_popup_counter
             < user_preferences.asset_popup_counter_max
-        ):
+        ) or utils.profile_is_validator():
             # this is shown only to users who don't know yet about the popup card.
             label = self.new_text(
                 "Right click for menu.",
@@ -481,7 +481,11 @@ class BlenderKitAssetBarOperator(BL_UI_OT_draw_operator):
                 text_size=self.author_text_size,
             )
             self.tooltip_widgets.append(label)
+            self.comments = label
             offset += 1
+            if utils.profile_is_validator():
+                label.multiline = True
+                label.text = "No comments yet."
         # version warning
         version_warning = self.new_text(
             "",
@@ -850,6 +854,7 @@ class BlenderKitAssetBarOperator(BL_UI_OT_draw_operator):
             red_alert.active = False
             new_button.red_alert = red_alert
             self.red_alerts.append(red_alert)
+
         # if result['downloaded'] > 0:
         #     ui_bgl.draw_rect(x, y, int(ui_props.thumb_size * result['downloaded'] / 100.0), 2, green)
 
@@ -1183,6 +1188,29 @@ class BlenderKitAssetBarOperator(BL_UI_OT_draw_operator):
         if asset_data["assetBaseId"] == asset_id:
             set_thumb_check(self.tooltip_image, asset_data, thumb_type="thumbnail")
 
+    def update_comments_for_validators(self, asset_data):
+        if utils.profile_is_validator():
+
+            comments = global_vars.DATA.get("asset comments", {})
+            comments = comments.get(asset_data["assetBaseId"], [])
+            comment_text = "No comments yet."
+            if comments is not None:
+                comment_text = ""
+                # iterate comments from last to first
+                for comment in reversed(comments):
+                    comment_text += f"{comment['userName']}:\n"
+                    # strip urls and stuff
+                    comment_lines = comment["comment"].split("\n")
+                    for line in comment_lines:
+                        urls, text = utils.has_url(line)
+                        if urls:
+                            comment_text += f"{text}{urls[0][0]}\n"
+                        else:
+                            comment_text += f"{text}\n"
+                    comment_text += "\n"
+
+            self.comments.text = comment_text
+
     # handlers
     def enter_button(self, widget):
         if not hasattr(widget, "button_index"):
@@ -1225,6 +1253,9 @@ class BlenderKitAssetBarOperator(BL_UI_OT_draw_operator):
             if utils.profile_is_validator():
                 quality_text += f" / {int(asset_data['score'])}"
             self.quality_label.text = quality_text
+
+            # preview comments for validators
+            self.update_comments_for_validators(asset_data)
 
             from_newer, difference = utils.asset_from_newer_blender_version(asset_data)
             if from_newer:
@@ -1517,10 +1548,31 @@ class BlenderKitAssetBarOperator(BL_UI_OT_draw_operator):
             search.search(author_id=a)
         return True
 
+    def search_similar(self, asset_index):
+        sr = global_vars.DATA["search results"]
+        asset_data = sr[asset_index]
+        keywords = search.get_search_similar_keywords(asset_data)
+        sprops = utils.get_search_props()
+        sprops.search_keywords = keywords
+        search.search()
+
+    def search_in_category(self, asset_index):
+        sr = global_vars.DATA["search results"]
+        asset_data = sr[asset_index]
+        category = asset_data.get("category")
+        if category is None:
+            return True
+        sprops = utils.get_search_props()
+        sprops.search_category = category
+        search.search()
+
     def handle_key_input(self, event):
+        # Shortcut: Search by author
         if event.type == "A":
             self.search_by_author(self.active_index)
             return True
+
+        # Shortcut: Delete asset from harddrive
         if event.type == "X" and self.active_index > -1:
             # delete downloaded files for this asset
             sr = global_vars.DATA["search results"]
@@ -1529,14 +1581,48 @@ class BlenderKitAssetBarOperator(BL_UI_OT_draw_operator):
             paths.delete_asset_debug(asset_data)
             asset_data["downloaded"] = 0
             return True
+
+        # Shortcut: Open Author's personal Webpage
         if event.type == "W" and self.active_index > -1:
             sr = global_vars.DATA["search results"]
             asset_data = sr[self.active_index]
-            a = global_vars.DATA["bkit authors"].get(asset_data["author"]["id"])
-            if a is not None:
-                utils.p("author:", a)
-                if a.get("aboutMeUrl") is not None:
-                    bpy.ops.wm.url_open(url=a["aboutMeUrl"])
+            author = global_vars.DATA["bkit authors"].get(asset_data["author"]["id"])
+            if author is None:
+                print("author is none")
+                return True
+            utils.p("author:", author)
+            url = author.get("aboutMeUrl")
+            if url is None:
+                print("url is none")
+                return True
+            bpy.ops.wm.url_open(url=url)
+            return True
+
+        # Shortcut: Search Similar
+        if event.type == "S" and self.active_index > -1:
+            self.search_similar(self.active_index)
+            return True
+
+        if event.type == "C" and self.active_index > -1:
+            self.search_in_category(self.active_index)
+            return True
+
+        if event.type == "B" and self.active_index > -1:
+            sr = global_vars.DATA["search results"]
+            asset_data = sr[self.active_index]
+            bpy.ops.wm.blenderkit_bookmark_asset(asset_id=asset_data["id"])
+            return True
+
+        # Shortcut: Open Author's profile on BlenderKit
+        if event.type == "P" and self.active_index > -1:
+            sr = global_vars.DATA["search results"]
+            asset_data = sr[self.active_index]
+            author = global_vars.DATA["bkit authors"].get(asset_data["author"]["id"])
+            if author is None:
+                return True
+            utils.p("author:", author)
+            url = paths.get_author_gallery_url(author["id"])
+            bpy.ops.wm.url_open(url=url)
             return True
 
         # FastRateMenu

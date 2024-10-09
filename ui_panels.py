@@ -33,8 +33,8 @@ from . import (
     asset_bar_op,
     autothumb,
     categories,
+    client_lib,
     comments_utils,
-    daemon_lib,
     download,
     global_vars,
     icons,
@@ -372,10 +372,10 @@ def draw_assetbar_show_hide(layout, props):
 
     if ui_props.assetbar_on:
         icon = "HIDE_OFF"
-        ttip = "Click to Hide Asset Bar"
+        ttip = "Click to Hide Asset Bar.\nShortcut: ;"
     else:
         icon = "HIDE_ON"
-        ttip = "Click to Show Asset Bar"
+        ttip = "Click to Show Asset Bar.\nShortcut: ;"
 
     op = layout.operator("view3d.blenderkit_asset_bar_widget", text="", icon=icon)
     op.keep_running = False
@@ -748,7 +748,7 @@ class MarkNotificationRead(bpy.types.Operator):
             if n["id"] == self.notification_id:
                 n["unread"] = 0
         comments_utils.check_notifications_read()
-        daemon_lib.mark_notification_read(self.notification_id)
+        client_lib.mark_notification_read(self.notification_id)
         return {"FINISHED"}
 
 
@@ -768,7 +768,7 @@ class MarkAllNotificationsRead(bpy.types.Operator):
         for n in notifications.get("results"):
             if n["unread"] == 1:
                 n["unread"] = 0
-                daemon_lib.mark_notification_read(n["id"])
+                client_lib.mark_notification_read(n["id"])
 
         comments_utils.check_notifications_read()
         return {"FINISHED"}
@@ -844,7 +844,7 @@ class UpvoteComment(bpy.types.Operator):
                         ):
                             comment["flags"].remove(flag)
                             break
-        daemon_lib.feedback_comment(self.asset_id, self.comment_id, api_key, self.flag)
+        client_lib.feedback_comment(self.asset_id, self.comment_id, api_key, self.flag)
         return {"FINISHED"}
 
 
@@ -882,7 +882,7 @@ class SetPrivateComment(bpy.types.Operator):
             for comment in comments:
                 if comment["id"] == self.comment_id:
                     comment["isPrivate"] = self.is_private
-        daemon_lib.mark_comment_private(
+        client_lib.mark_comment_private(
             self.asset_id, self.comment_id, api_key, self.is_private
         )
         return {"FINISHED"}
@@ -953,7 +953,7 @@ class PostComment(bpy.types.Operator):
         user_preferences = bpy.context.preferences.addons[__package__].preferences
         ui_props = bpy.context.window_manager.blenderkitUI
         api_key = user_preferences.api_key
-        daemon_lib.create_comment(
+        client_lib.create_comment(
             self.asset_id, ui_props.new_comment, api_key, self.comment_id
         )
         ui_props.new_comment = ""
@@ -1835,12 +1835,11 @@ class BlenderKitWelcomeOperator(bpy.types.Operator):
 
 
 class OpenSystemDirectory(bpy.types.Operator):
-    """Open system directory"""
+    """Open directory in default system file explorer"""
 
     bl_idname = "wm.blenderkit_open_system_directory"
     bl_label = "Open system directory"
     bl_options = {"REGISTER", "UNDO"}
-
     directory: StringProperty(name="directory", default="")
 
     @classmethod
@@ -1849,10 +1848,52 @@ class OpenSystemDirectory(bpy.types.Operator):
 
     def execute(self, context):
         if not os.path.exists(self.directory):
+            self.report({"ERROR"}, "Directory not found.")
+            return {"CANCELLED"}
+        paths.open_path_in_file_browser(self.directory)
+        return {"FINISHED"}
+
+
+class OpenAssetDirectory(OpenSystemDirectory):
+    """Open directory containing the asset data"""
+
+    bl_idname = "wm.blenderkit_open_asset_directory"
+    bl_label = "Open asset directory"
+
+    def execute(self, context):
+        if not os.path.exists(self.directory):
             self.report({"ERROR"}, "Directory not found. Asset not downloaded yet.")
             return {"CANCELLED"}
         paths.open_path_in_file_browser(self.directory)
         return {"FINISHED"}
+
+
+class OpenAddonDirectory(OpenSystemDirectory):
+    """Open the directory in which the BlenderKit add-on is installed. Move one level up and delete it to hard-uninstall the add-on"""
+
+    bl_idname = "wm.blenderkit_open_addon_directory"
+    bl_label = "Open global directory"
+
+
+class OpenGlobalDirectory(OpenSystemDirectory):
+    """Open the BlenderKit's Global directory. This is the directory where BlenderKit stores downloaded assets. It also contains Client binary and log files"""
+
+    bl_idname = "wm.blenderkit_open_global_directory"
+    bl_label = "Open global directory"
+
+
+class OpenClientLog(OpenSystemDirectory):
+    """Open Log file of currently running Client. Client logs errors and other message in here. Inspect to see what is wrong with Client. Copy the contents when you make a bug report"""
+
+    bl_idname = "wm.blenderkit_open_client_log"
+    bl_label = "Open Client log"
+
+
+class OpenTempDirectory(OpenSystemDirectory):
+    """Open BlenderKit's temporary directory. This is the directory where thumbnails and other temporary files are stored"""
+
+    bl_idname = "wm.blenderkit_open_temp_directory"
+    bl_label = "Open temp directory"
 
 
 def draw_asset_context_menu(layout, context, asset_data, from_panel=False):
@@ -1904,15 +1945,10 @@ def draw_asset_context_menu(layout, context, asset_data, from_panel=False):
 
     op = layout.operator("view3d.blenderkit_search", text="Search Similar")
     op.esc = True
-    op.tooltip = "Search for similar assets in the library"
-    # build search string from description and tags:
-    op.keywords = asset_data["name"]
-    if asset_data.get("description"):
-        op.keywords += " " + asset_data.get("description") + " "
-    op.keywords += " ".join(asset_data.get("tags"))
+    op.tooltip = "Search for similar assets in the library.\nShortcut: hover over asset in asset bar and press 'S'."
+    op.keywords = search.get_search_similar_keywords(asset_data)
 
     op = layout.operator("wm.url_open", text="See online", icon="URL")
-
     if (
         utils.user_is_owner(asset_data)
         and asset_data["verificationStatus"] != "validated"
@@ -1930,7 +1966,7 @@ def draw_asset_context_menu(layout, context, asset_data, from_panel=False):
     dir_paths = paths.get_asset_directories(asset_data)
     if len(dir_paths) > 0 and os.path.exists(dir_paths[-1]):
         op = layout.operator(
-            "wm.blenderkit_open_system_directory",
+            "wm.blenderkit_open_asset_directory",
             text="Open Directory",
             icon="FILE_FOLDER",
         )
@@ -2183,34 +2219,36 @@ def label_or_url_or_operator(
     operator_kwargs={},
     icon_value=None,
     icon=None,
+    emboss=False,
 ):
     """automatically switch between different layout options for linking or tooltips"""
-    layout.emboss = "NONE"
+    layout.emboss = "NORMAL" if emboss else "NONE"
 
     if operator is not None:
         if icon:
-            op = layout.operator(operator, text=text, icon=icon)
+            op = layout.operator(operator, text=text, icon=icon, emboss=emboss)
         elif icon_value:
-            op = layout.operator(operator, text=text, icon_value=icon_value)
+            op = layout.operator(
+                operator, text=text, icon_value=icon_value, emboss=emboss
+            )
         else:
-            op = layout.operator(operator, text=text)
+            op = layout.operator(operator, text=text, emboss=emboss)
         for kwarg in operator_kwargs.keys():
-            if type(operator_kwargs[kwarg]) == str:
-                quoatation = '"'
-                operator_kwargs[kwarg] = operator_kwargs[kwarg].replace('"', "'")
-            else:
-                quoatation = ""
-            exec(f"op.{kwarg} = {quoatation}{operator_kwargs[kwarg]}{quoatation}")
+            setattr(op, kwarg, operator_kwargs[kwarg])
         push_op_left(layout, strength=2)
 
         return
     if url != "":
         if icon:
-            op = layout.operator("wm.blenderkit_url", text=text, icon=icon)
+            op = layout.operator(
+                "wm.blenderkit_url", text=text, icon=icon, emboss=emboss
+            )
         elif icon_value:
-            op = layout.operator("wm.blenderkit_url", text=text, icon_value=icon_value)
+            op = layout.operator(
+                "wm.blenderkit_url", text=text, icon_value=icon_value, emboss=emboss
+            )
         else:
-            op = layout.operator("wm.blenderkit_url", text=text)
+            op = layout.operator("wm.blenderkit_url", text=text, emboss=emboss)
         op.url = url
         op.tooltip = tooltip
         push_op_left(layout, strength=5)
@@ -2218,13 +2256,15 @@ def label_or_url_or_operator(
         return
     if tooltip != "":
         if icon:
-            op = layout.operator("wm.blenderkit_tooltip", text=text, icon=icon)
+            op = layout.operator(
+                "wm.blenderkit_tooltip", text=text, icon=icon, emboss=emboss
+            )
         elif icon_value:
             op = layout.operator(
-                "wm.blenderkit_tooltip", text=text, icon_value=icon_value
+                "wm.blenderkit_tooltip", text=text, icon_value=icon_value, emboss=emboss
             )
         else:
-            op = layout.operator("wm.blenderkit_tooltip", text=text)
+            op = layout.operator("wm.blenderkit_tooltip", text=text, emboss=emboss)
         op.tooltip = tooltip
 
         # these are here to move the text to left, since operators can only center text by default
@@ -2265,6 +2305,7 @@ class AssetPopupCard(bpy.types.Operator, ratings_utils.RatingProperties):
         tooltip="",
         operator=None,
         operator_kwargs={},
+        emboss=False,
     ):
         right = str(right)
         row = layout.row()
@@ -2274,8 +2315,9 @@ class AssetPopupCard(bpy.types.Operator, ratings_utils.RatingProperties):
         split = split.split()
         split.alignment = "LEFT"
         # split for questionmark:
-        if url != "":
-            split = split.split(factor=0.6)
+        # if url != "" and not emboss:
+        split = split.split(factor=0.9)
+        split.alignment = "LEFT"
         label_or_url_or_operator(
             split,
             text=right,
@@ -2285,9 +2327,11 @@ class AssetPopupCard(bpy.types.Operator, ratings_utils.RatingProperties):
             operator_kwargs=operator_kwargs,
             icon_value=icon_value,
             icon=icon,
+            emboss=emboss,
         )
         # additional questionmark icon where it's important?
-        if url != "":
+        # Embossed elements are visibly clickable, so we don't need the questionmark icon
+        if url != "" and not emboss:
             split = split.split()
             op = split.operator("wm.blenderkit_url", text="", icon="QUESTION")
             op.url = url
@@ -2312,12 +2356,14 @@ class AssetPopupCard(bpy.types.Operator, ratings_utils.RatingProperties):
                 "keywords": f"+{key}:{parameter}",
                 "tooltip": f"search by {parameter}",
             }
+            # search gets auto emboss
             self.draw_property(
                 layout,
                 pretext,
                 parameter,
                 operator="view3d.blenderkit_search",
                 operator_kwargs=kwargs,
+                emboss=True,
             )
         else:
             self.draw_property(layout, pretext, parameter)
@@ -2352,7 +2398,7 @@ class AssetPopupCard(bpy.types.Operator, ratings_utils.RatingProperties):
 
         box = layout.box()
 
-        box.scale_y = 0.4
+        box.scale_y = 0.6
         box.label(text="Properties")
         box.separator()
 
@@ -2568,6 +2614,49 @@ class AssetPopupCard(bpy.types.Operator, ratings_utils.RatingProperties):
                 # icon='ERROR',
                 # tooltip='The version this asset was created in.',
             )
+
+        # Add TwinBru specific parameters for material assets
+        # only if they have twinbruReference in the dictparameters
+        if self.asset_data.get("dictParameters").get("twinbruReference"):
+            box.separator()
+            box.label(text="TwinBru physical material categories")
+
+            self.draw_asset_parameter(
+                box,
+                key="twinBruCatEndUse",
+                pretext="End Use",
+                do_search=True,
+            )
+            self.draw_asset_parameter(
+                box,
+                key="twinBruColourType",
+                pretext="Colour Type",
+                do_search=True,
+            )
+            self.draw_asset_parameter(
+                box,
+                key="twinBruCharacteristics",
+                pretext="Characteristics",
+                do_search=True,
+            )
+            self.draw_asset_parameter(
+                box,
+                key="twinBruDesignType",
+                pretext="Design Type",
+                do_search=True,
+            )
+
+        # Product Link for assets that have it.
+        if self.asset_data.get("dictParameters").get("productLink"):
+            self.draw_property(
+                box,
+                "Product Link",
+                "View on manufacturer's website",
+                url=self.asset_data["dictParameters"]["productLink"],
+                icon="URL",
+                emboss=True,
+            )
+
         box.separator()
 
     def draw_author_area(self, context, layout, width=330):
@@ -2623,6 +2712,7 @@ class AssetPopupCard(bpy.types.Operator, ratings_utils.RatingProperties):
         op = button_row.operator(
             "view3d.blenderkit_search", text="Find Assets By Author", icon="VIEWZOOM"
         )
+        op.tooltip = "Search all assets by this author.\nShortcut: Hover over the asset in the asset bar and press 'A'."
         op.esc = True
         op.keywords = ""
         op.author_id = self.asset_data["author"]["id"]
@@ -2631,7 +2721,7 @@ class AssetPopupCard(bpy.types.Operator, ratings_utils.RatingProperties):
 
         # AUTHOR's BLENDERKIT PROFILE
         url = paths.get_author_gallery_url(author["id"])
-        tooltip = "Go to author's profile on BlenderKit webpage"
+        tooltip = "Go to author's profile on BlenderKit web.\nShortcut: Hover over asset in the asset bar and press 'P'."
         icon_value = pcoll["logo"].icon_id
         op = button_row.operator("wm.blenderkit_url", text="", icon_value=icon_value)
         op.url = url
@@ -2644,7 +2734,7 @@ class AssetPopupCard(bpy.types.Operator, ratings_utils.RatingProperties):
             text = utils.shorten_text(text, 45)
             op = button_row.operator("wm.blenderkit_url", text="", icon="URL")
             op.url = url
-            op.tooltip = f"Go to author's personal web page: \n\n{url}\n"
+            op.tooltip = f"Go to author's personal Webpage: {url}\nShortcut: Hover over asset in the asset bar and press 'W'."
 
         # SOCIAL NETWORKS
         social_networks = author.get("socialNetworks", [])
@@ -2823,11 +2913,12 @@ class AssetPopupCard(bpy.types.Operator, ratings_utils.RatingProperties):
 
         for i, c in enumerate(cat_path):
             cat_name = cat_path_names[i]
-
             ui_props = bpy.context.window_manager.blenderkitUI
-            op = name_row.operator(
-                "view3d.blenderkit_set_category", text=cat_name + "     >", emboss=True
-            )
+            if i < len(cat_path) - 1:
+                bl_id = "view3d.blenderkit_set_category_in_popup_card"
+            else:
+                bl_id = "view3d.blenderkit_set_category_in_popup_card_last"
+            op = name_row.operator(bl_id, text=cat_name + "     >", emboss=True)
             op.asset_type = ui_props.asset_type
             # this gets filled not to change anything in browsing categories
             op.category_browse = global_vars.DATA["active_category_browse"][
@@ -3070,7 +3161,7 @@ class AssetPopupCard(bpy.types.Operator, ratings_utils.RatingProperties):
         api_key = user_preferences.api_key
         comments = comments_utils.get_comments_local(asset_data["assetBaseId"])
         # if comments is None:
-        daemon_lib.get_comments(asset_data["assetBaseId"], api_key)
+        client_lib.get_comments(asset_data["assetBaseId"], api_key)
 
         # TODO: SHOULD BE DONE ONCE COMMENTS TASK IS RETURNED - HOW TO INVOKE REFRESH FROM HANDLE_GET_COMMENTS_TASK
         comments = global_vars.DATA.get("asset comments", {})
@@ -3112,10 +3203,8 @@ class SetCommentReplyId(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class SetCategoryOperator(bpy.types.Operator):
-    """Visit subcategory"""
-
-    bl_idname = "view3d.blenderkit_set_category"
+class SetCategoryOperatorOrigin(bpy.types.Operator):
+    bl_idname = "view3d.blenderkit_set_category_origin"
     bl_label = "BlenderKit Set Active Category"
     bl_options = {"REGISTER", "UNDO", "INTERNAL"}
 
@@ -3152,6 +3241,26 @@ class SetCategoryOperator(bpy.types.Operator):
         # we have to write back to wm. Thought this should happen with original list.
         global_vars.DATA["active_category_browse"][self.asset_type] = acat
         return {"FINISHED"}
+
+
+# TODO: Handle here SelectSubcategory/SelectCategory
+# and VisitSubcategory/VisitCategory and VisitUpperCategory/VisitUpperSubcategory
+class SetCategoryOperator(SetCategoryOperatorOrigin):
+    """Visit subcategory"""
+
+    bl_idname = "view3d.blenderkit_set_category"
+
+
+class SetCategoryOperatorInPopupCard(SetCategoryOperatorOrigin):
+    """Subcategory of the asset. Click to search this subcategory."""
+
+    bl_idname = "view3d.blenderkit_set_category_in_popup_card"
+
+
+class SetCategoryOperatorLastInPopupCard(SetCategoryOperatorOrigin):
+    """Subcategory of the asset. Click to search this subcategory. Shortcut: Hover over asset in the asset bar and press 'C'."""
+
+    bl_idname = "view3d.blenderkit_set_category_in_popup_card_last"
 
 
 class ClosePopupButton(bpy.types.Operator):
@@ -3599,7 +3708,10 @@ def ui_message(title, message):
 preview_collections = {}
 
 classes = (
+    SetCategoryOperatorOrigin,
     SetCategoryOperator,
+    SetCategoryOperatorInPopupCard,
+    SetCategoryOperatorLastInPopupCard,
     SetCommentReplyId,
     VIEW3D_PT_blenderkit_profile,
     # VIEW3D_PT_blenderkit_login,
@@ -3617,6 +3729,11 @@ classes = (
     NODE_PT_blenderkit_material_properties,
     OpenBlenderKitDiscord,
     OpenSystemDirectory,
+    OpenAssetDirectory,
+    OpenAddonDirectory,
+    OpenGlobalDirectory,
+    OpenClientLog,
+    OpenTempDirectory,
     # VIEW3D_PT_blenderkit_ratings,
     VIEW3D_PT_blenderkit_downloads,
     # OBJECT_MT_blenderkit_resolution_menu,

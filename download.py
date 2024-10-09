@@ -25,8 +25,8 @@ import time
 
 from . import (
     append_link,
-    daemon_lib,
-    daemon_tasks,
+    client_lib,
+    client_tasks,
     global_vars,
     paths,
     reports,
@@ -127,7 +127,7 @@ def scene_save(context):
         get_asset_usages()
     )  # TODO: FIX OR REMOVE THIS (now returns empty dict all the time) https://github.com/BlenderKit/blenderkit/issues/1013
     if report_data != {}:
-        daemon_lib.report_usages(report_data)
+        client_lib.report_usages(report_data)
 
 
 @persistent
@@ -712,7 +712,7 @@ def replace_resolution_appended(file_paths, asset_data, resolution):
 #     return .5
 
 
-def handle_download_task(task: daemon_tasks.Task):
+def handle_download_task(task: client_tasks.Task):
     """Handle incoming task information.
     Update progress. Print messages. Fire post-download functions.
     """
@@ -746,7 +746,7 @@ def clear_downloads():
 
 
 def download_write_progress(task_id, task):
-    """writes progress from daemon_lib reports to addon tasks list"""
+    """writes progress from client_lib reports to addon tasks list"""
     global download_tasks
     task_addon = download_tasks.get(task.task_id)
     if task_addon is None:
@@ -764,7 +764,7 @@ def download_write_progress(task_id, task):
 
 
 # TODO might get moved to handle all blenderkit stuff, not to slow down.
-def download_post(task: daemon_tasks.Task):
+def download_post(task: client_tasks.Task):
     """
     Check for running and finished downloads.
     Running downloads get checked for progress which is passed to UI.
@@ -884,9 +884,48 @@ def download(asset_data, **kwargs):
     data["download_dirs"] = paths.get_download_dirs(asset_data["assetType"])
     if "downloaders" in kwargs:
         data["downloaders"] = kwargs["downloaders"]
-    response = daemon_lib.asset_download(data)
+    response = client_lib.asset_download(data)
 
     download_tasks[response["task_id"]] = data
+
+
+def handle_bkclientjs_get_asset(task: client_tasks.Task):
+    """Handle incoming bkclientjs/get_asset task. User asked for download in online gallery. How it goes:
+    1. Webpage tries to connect to Client, gets data about connected Softwares
+    2. User choosed Blender with appID of this Blender
+    2. Client gets asset data from API
+    3. Client creates finished task bkclientjs/get_asset containing asset data
+    4. We handle the task in here
+    5. We request the download of the asset as if user has clicked it inside Blender
+
+    TODO: #1262Implement append to universal search results instead.
+    """
+    pass
+    """ UNUSED CODE for direct download:
+    prefs = utils.get_preferences_as_dict()
+    prefs["resolution"] = task.result["resolution"]
+    prefs["scene_id"] = utils.get_scene_id()
+    download_dirs = paths.get_download_dirs(task.result["asset_data"]["assetType"])
+    data = {
+        "asset_data": task.result["asset_data"],
+        "download_dirs": download_dirs,
+        "PREFS": prefs,
+        "progress": 0,
+        "text": f'Getting asset {task.result["asset_data"]["name"]}',
+        "downloaders": [{'location': (0.0, 0.0, 0.0), 'rotation': (0.0, 0.0, 0.0)}],
+        "cast_parent": "",
+        "target_object": task.result["asset_data"]["name"],
+        "material_target_slot": 0,
+        "model_location": (0.0, 0.0, 0.0),
+        "model_rotation": (0.0, 0.0, 0.0),
+        "replace": False,
+        "replace_resolution": False,
+        "resolution": task.result["resolution"],
+    }
+
+    response = client_lib.asset_download(data)
+    download_tasks[response["task_id"]] = data
+    """
 
 
 def check_downloading(asset_data, **kwargs) -> bool:
@@ -1051,45 +1090,52 @@ def duplicate_asset(source, **kwargs):
 def asset_in_scene(asset_data):
     """checks if the asset is already in scene. If yes, modifies asset data so the asset can be reached again."""
     scene = bpy.context.scene
-    au = scene.get("assets used", {})
+    assets_used = scene.get("assets used", {})
 
-    id = asset_data["assetBaseId"]
-    if id in au.keys():
-        ad = au[id]
-        if ad.get("files"):
-            for fi in ad["files"]:
-                if fi.get("file_name") != None:
-                    for fi1 in asset_data["files"]:
-                        if fi["fileType"] == fi1["fileType"]:
-                            fi1["file_name"] = fi["file_name"]
-                            fi1["url"] = fi["url"]
+    base_id = asset_data["assetBaseId"]
+    if base_id not in assets_used.keys():
+        return False, None
 
-                            # browse all collections since linked collections can have same name.
-                            if asset_data["assetType"] == "model":
-                                for c in bpy.data.collections:
-                                    if c.name == ad["name"]:
-                                        # there can also be more linked collections with same name, we need to check id.
-                                        if (
-                                            c.library
-                                            and c.library.get("asset_data")
-                                            and c.library["asset_data"]["assetBaseId"]
-                                            == id
-                                        ):
-                                            bk_logger.info("asset linked")
-                                            return "LINKED", ad.get("resolution")
-                            elif asset_data["assetType"] == "material":
-                                for m in bpy.data.materials:
-                                    if not m.get("asset_data"):
-                                        continue
-                                    if (
-                                        m["asset_data"]["assetBaseId"]
-                                        == asset_data["assetBaseId"]
-                                        and bpy.context.active_object.active_material.library
-                                    ):
-                                        return "LINKED", ad.get("resolution")
+    ad = assets_used[base_id]
+    if not ad.get("files"):
+        return False, None
 
-                            bk_logger.info("asset appended")
-                            return "APPENDED", ad.get("resolution")
+    for fi in ad["files"]:
+        if fi.get("file_name") == None:
+            continue
+
+        for fi1 in asset_data["files"]:
+            if fi["fileType"] != fi1["fileType"]:
+                continue
+
+            fi1["file_name"] = fi["file_name"]
+            fi1["url"] = fi["url"]
+
+            # browse all collections since linked collections can have same name.
+            if asset_data["assetType"] == "model":
+                for c in bpy.data.collections:
+                    if c.name != ad["name"]:
+                        continue
+
+                    # there can also be more linked collections with same name, we need to check base_id.
+                    if not c.library.get("asset_data"):
+                        continue
+                    if (
+                        c.library
+                        and c.library["asset_data"].get("assetBaseId") == base_id
+                    ):
+                        bk_logger.info("asset found linked in the scene")
+                        return "LINKED", ad.get("resolution")
+            elif asset_data["assetType"] == "material":
+                for m in bpy.data.materials:
+                    if not m.get("asset_data"):
+                        continue
+                    if m.library and m["asset_data"].get("assetBaseId") == base_id:
+                        bk_logger.info("asset found linked in the scene")
+                        return "LINKED", ad.get("resolution")
+
+            bk_logger.info("asset found appended in the scene")
+            return "APPENDED", ad.get("resolution")
     return False, None
 
 
@@ -1152,7 +1198,7 @@ class BlenderkitKillDownloadOperator(bpy.types.Operator):
     def execute(self, context):
         global download_tasks
         download_tasks.pop(self.task_id)
-        daemon_lib.cancel_download(self.task_id)
+        client_lib.cancel_download(self.task_id)
         return {"FINISHED"}
 
 

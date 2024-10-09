@@ -25,7 +25,7 @@ for addon in bpy.context.preferences.addons:
     if "blenderkit" in addon.module:
         __package__ = addon.module
         break
-from . import daemon_lib, global_vars
+from . import client_lib, global_vars
 
 
 class Test01Registration(unittest.TestCase):
@@ -48,7 +48,7 @@ class Test01Registration(unittest.TestCase):
             # SYSTEM STUFF
             "debug_value": bpy.app.debug_value,
             "binary_path": bpy.app.binary_path,
-            "addon_dir": daemon_lib.get_addon_dir(),
+            "addon_dir": client_lib.get_addon_dir(),
             "addon_module_name": __package__,
             "app_id": os.getpid(),
             # STATISTICS
@@ -75,7 +75,7 @@ class Test01Registration(unittest.TestCase):
             "tips_on_start": user_preferences.tips_on_start,
             "announcements_on_start": user_preferences.announcements_on_start,
             # NETWORK
-            "daemon_port": user_preferences.daemon_port,
+            "client_port": user_preferences.client_port,
             "ip_version": user_preferences.ip_version,
             "ssl_context": user_preferences.ssl_context,
             "proxy_which": user_preferences.proxy_which,

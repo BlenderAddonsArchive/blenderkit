@@ -23,7 +23,7 @@ from bpy.props import StringProperty
 from bpy.types import Gizmo, GizmoGroup, Operator
 from mathutils import Matrix
 
-from . import daemon_lib, global_vars, icons, ratings_utils, ui, ui_panels, utils
+from . import client_lib, global_vars, icons, ratings_utils, ui, ui_panels, utils
 
 
 bk_logger = logging.getLogger(__name__)
@@ -183,7 +183,7 @@ class FastRateMenu(Operator, ratings_utils.RatingProperties):
 
 
 class SetBookmark(bpy.types.Operator):
-    """Add or remove bookmarking of the asset"""
+    """Add or remove bookmarking of the asset.\nShortcut: hover over asset in the asset bar and press 'B'."""
 
     bl_idname = "wm.blenderkit_bookmark_asset"
     bl_label = "BlenderKit bookmark assest"
@@ -214,7 +214,7 @@ class SetBookmark(bpy.types.Operator):
         ratings_utils.store_rating_local(
             self.asset_id, type="bookmarks", value=bookmark_value
         )
-        daemon_lib.send_rating(self.asset_id, "bookmarks", bookmark_value)
+        client_lib.send_rating(self.asset_id, "bookmarks", bookmark_value)
         return {"FINISHED"}
 
 

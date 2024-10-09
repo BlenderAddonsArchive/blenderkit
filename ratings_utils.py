@@ -29,13 +29,13 @@ from bpy.props import (
 )
 from bpy.types import PropertyGroup
 
-from . import daemon_lib, daemon_tasks, global_vars, icons, reports, tasks_queue, utils
+from . import client_lib, client_tasks, global_vars, icons, reports, tasks_queue, utils
 
 
 bk_logger = logging.getLogger(__name__)
 
 
-def handle_get_rating_task(task: daemon_tasks.Task):
+def handle_get_rating_task(task: client_tasks.Task):
     """Handle incomming get_rating task by saving the results into global_vars."""
     if task.status == "created":
         return
@@ -53,7 +53,7 @@ def handle_get_rating_task(task: daemon_tasks.Task):
         store_rating_local(asset_id, rating["ratingType"], rating["score"])
 
 
-def handle_get_bookmarks_task(task: daemon_tasks.Task):
+def handle_get_bookmarks_task(task: client_tasks.Task):
     """Handle incomming get_bookmarks task by saving the results into global_vars.
     This is different from standard ratings - the results come from elastic search API
     instead of ratings API.
@@ -68,7 +68,7 @@ def handle_get_bookmarks_task(task: daemon_tasks.Task):
         store_rating_local(asset_data["id"], "bookmarks", 1)
 
 
-def handle_send_rating_task(task: daemon_tasks.Task):
+def handle_send_rating_task(task: client_tasks.Task):
     """Handle send rating task."""
     if task.status == "created":
         return
@@ -110,7 +110,7 @@ def ensure_rating(asset_id):
     """
     r = global_vars.DATA["asset ratings"].get(asset_id, {})
     if "quality" not in r.keys() or "working_hours " not in r.keys():
-        daemon_lib.get_rating(asset_id)
+        client_lib.get_rating(asset_id)
 
 
 def update_ratings_quality(self, context):
@@ -139,7 +139,7 @@ def update_ratings_quality(self, context):
         return
 
     args = (asset_id, "quality", bkit_ratings.rating_quality)
-    tasks_queue.add_task((daemon_lib.send_rating, args), wait=0.5, only_last=True)
+    tasks_queue.add_task((client_lib.send_rating, args), wait=0.5, only_last=True)
 
 
 def update_ratings_work_hours(self, context):
@@ -171,7 +171,7 @@ def update_ratings_work_hours(self, context):
         return
 
     args = (asset_id, "working_hours", bkit_ratings.rating_work_hours)
-    tasks_queue.add_task((daemon_lib.send_rating, args), wait=0.5, only_last=True)
+    tasks_queue.add_task((client_lib.send_rating, args), wait=0.5, only_last=True)
 
 
 def update_quality_ui(self, context):
@@ -329,9 +329,9 @@ class RatingProperties(PropertyGroup):
 
     # the following enum is only to ease interaction - enums support 'drag over' and enable to draw the stars easily.
     rating_quality_ui: EnumProperty(
-        name="rating_quality_ui",
+        name="Quality",
         items=stars_enum_callback,
-        description="Rating stars 0 - 10",
+        description="Rate the quality of the asset from 1 to 10 stars.\nShortcut: Hover over asset in the asset bar and press 'R' to show rating menu",
         default=0,
         update=update_quality_ui,
         options={"SKIP_SAVE"},
@@ -346,7 +346,7 @@ class RatingProperties(PropertyGroup):
     )
     rating_work_hours: FloatProperty(
         name="Work Hours",
-        description="How many hours did this work take?",
+        description="How many hours did this work take?\nShortcut: Hover over asset in the asset bar and press 'R' to show rating menu.",
         default=0.00,
         min=0.0,
         max=300,
@@ -355,7 +355,7 @@ class RatingProperties(PropertyGroup):
     )
     rating_work_hours_ui: EnumProperty(
         name="Work Hours",
-        description="How many hours did this work take?",
+        description="How many hours did this work take?\nShortcut: Hover over asset in the asset bar and press 'R' to show rating menu",
         items=wh_enum_callback,
         default=0,
         update=update_ratings_work_hours_ui,

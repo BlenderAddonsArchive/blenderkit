@@ -37,8 +37,8 @@ from . import (
     asset_inspector,
     autothumb,
     categories,
-    daemon_lib,
-    daemon_tasks,
+    client_lib,
+    client_tasks,
     global_vars,
     image_utils,
     overrides,
@@ -883,7 +883,7 @@ class FastMetadata(bpy.types.Operator):
             "success": "Metadata upload succeded",
             "error": "Metadata upload failed",
         }
-        daemon_lib.nonblocking_request(url, "PATCH", {}, metadata, messages)
+        client_lib.nonblocking_request(url, "PATCH", {}, metadata, messages)
         return {"FINISHED"}
 
     def invoke(self, context, event):
@@ -1072,7 +1072,7 @@ class UploadOperator(Operator):
     bl_idname = "object.blenderkit_upload"
     bl_description = "Upload or re-upload asset + thumbnail + metadata"
 
-    bl_label = "BlenderKit asset upload"
+    bl_label = "BlenderKit Asset Upload"
     bl_options = {"REGISTER", "INTERNAL"}
 
     # type of upload - model, material, textures, e.t.c.
@@ -1131,7 +1131,7 @@ class UploadOperator(Operator):
         props.upload_state = "Upload initiating..."
         props.uploading = True
 
-        daemon_lib.asset_upload(upload_data, export_data, upload_set)
+        client_lib.asset_upload(upload_data, export_data, upload_set)
         return {"FINISHED"}
 
     def draw(self, context):
@@ -1206,6 +1206,13 @@ class UploadOperator(Operator):
                     "-   Check if it works as expected\n",
                     width=500,
                 )
+
+        if props.is_private == "PRIVATE":
+            utils.label_multiline(
+                layout,
+                width=500,
+                text="Would you like tu upload your asset to BlenderKit?",
+            )
 
     def invoke(self, context, event):
         if not utils.user_logged_in():
@@ -1315,7 +1322,7 @@ class AssetVerificationStatusChange(Operator):
             "success": "Verification status changed",
             "error": "Verification status change failed",
         }
-        daemon_lib.nonblocking_request(url, "PATCH", {}, upload_data, messages)
+        client_lib.nonblocking_request(url, "PATCH", {}, upload_data, messages)
 
         if asset_bar_op.asset_bar_operator is not None:
             asset_bar_op.asset_bar_operator.update_layout(context, None)
@@ -1329,7 +1336,7 @@ class AssetVerificationStatusChange(Operator):
         return {"RUNNING_MODAL"}
 
 
-def handle_asset_upload(task: daemon_tasks.Task):
+def handle_asset_upload(task: client_tasks.Task):
     asset = eval(f"{task.data['export_data']['eval_path']}.blenderkit")
     asset.upload_state = task.message
     if task.status == "error":
@@ -1366,7 +1373,7 @@ def handle_asset_upload(task: daemon_tasks.Task):
         return reports.add_report("Upload successfull")
 
 
-def handle_asset_metadata_upload(task: daemon_tasks.Task):
+def handle_asset_metadata_upload(task: client_tasks.Task):
     if task.status != "finished":
         return
 

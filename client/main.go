@@ -22,10 +22,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -33,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -63,13 +66,29 @@ const (
 	EmoDownload      = "⬇️ "
 	EmoIdentity      = "🆔"
 	EmoUpdate        = "🔜"
+	EmoBKClientJS    = "🌐"
+	EmoDebug         = "🪲"
+
+	// RETURN CODES
+	rcServerStartOtherError           = 40
+	rcServerStartOtherNetworkingError = 41
+	rcServerStartOtherSyscallError    = 42
+	rcServerStartSyscallEADDRINUSE    = 43
+	rcServerStartSyscallEACCES        = 44
+
+	// SOFTWARE NAMES
+	blender = "Blender"
+	godot   = "Godot"
 )
 
 var (
-	ClientVersion = "0.0.0" // Version of this BlenderKit-client binary, set from file client/VERSION with -ldflags during build in dev.py
-	SystemID      *string   // Unique ID of the current system (string of 15 integers)
-	Port          *string
-	Server        *string
+	ClientVersion        = "0.0.0" // Version of this BlenderKit-client binary, set from file client/VERSION with -ldflags during build in dev.py
+	SystemID             *string   // Unique ID of the current system (string of 15 integers)
+	Port                 *string   // Port on which Client should listen for HTTP requests
+	Server               *string   // Address of BlenderKit server to which Client should connect
+	StartingAddonVersion *string   // Version of the add-on which has started the Client
+	StartingSoftwareName *string   // Name of the software whose add-on has started the Client
+	StartingPID          *string   // Process ID of the software whose add-on has started the Client
 
 	OAuth2Sessions    map[string]OAuth2VerificationData // Map of OAuth2 sessions, key is the state string
 	OAuth2SessionsMux sync.Mutex
@@ -77,8 +96,8 @@ var (
 	lastReportAccess    time.Time
 	lastReportAccessMux sync.Mutex
 
-	ActiveAppsMux sync.Mutex
-	ActiveApps    []int
+	AvailableSoftwares    map[int]Software // Available Softwares which are connected to the Client
+	AvailableSoftwaresMux sync.Mutex
 
 	Tasks                map[int]map[string]*Task
 	TasksMux             sync.Mutex
@@ -99,6 +118,7 @@ func init() {
 	SystemID = getSystemID()
 	OAuth2Sessions = make(map[string]OAuth2VerificationData)
 	Tasks = make(map[int]map[string]*Task)
+	AvailableSoftwares = make(map[int]Software)
 	AddTaskCh = make(chan *Task, 1000)
 	TaskProgressUpdateCh = make(chan *TaskProgressUpdate, 1000)
 	TaskMessageCh = make(chan *TaskMessageUpdate, 1000)
@@ -130,6 +150,7 @@ func handleChannels() {
 			if task.Status == "finished" {
 				ChanLog.Printf("%s %s (%s)\n", EmoOK, task.TaskType, task.TaskID)
 			}
+
 		case u := <-TaskProgressUpdateCh:
 			if u.Message != "" {
 				ChanLog.Printf("%s progress on task %s (%d) - %d%%: %s\n", EmoUpdate, u.TaskID, u.AppID, u.Progress, u.Message)
@@ -138,6 +159,11 @@ func handleChannels() {
 			}
 			TasksMux.Lock()
 			task := Tasks[u.AppID][u.TaskID]
+			if task == nil {
+				ChanLog.Printf("%s TaskProgressUpdateCh: task[%d][%s] is nil", EmoWarning, u.AppID, u.TaskID)
+				continue
+			}
+
 			task.Progress = u.Progress
 			if u.Message != "" {
 				task.Message = u.Message
@@ -146,18 +172,30 @@ func handleChannels() {
 				task.MessageDetailed = u.MessageDetailed
 			}
 			TasksMux.Unlock()
+
 		case m := <-TaskMessageCh:
 			TasksMux.Lock()
 			task := Tasks[m.AppID][m.TaskID]
+			if task == nil {
+				ChanLog.Printf("%s TaskMessageCh: task[%d][%s] is nil", EmoWarning, m.AppID, m.TaskID)
+				continue
+			}
+
 			task.Message = m.Message
 			if m.MessageDetailed != "" {
 				task.MessageDetailed = m.MessageDetailed
 			}
 			TasksMux.Unlock()
 			ChanLog.Printf("%s %s (%s): %s\n", EmoInfo, task.TaskType, task.TaskID, m.Message)
+
 		case f := <-TaskFinishCh:
 			TasksMux.Lock()
 			task := Tasks[f.AppID][f.TaskID]
+			if task == nil {
+				ChanLog.Printf("%s TaskFinishCh: task[%d][%s] is nil", EmoWarning, f.AppID, f.TaskID)
+				continue
+			}
+
 			task.Status = "finished"
 			task.Result = f.Result
 			if f.Message != "" {
@@ -171,6 +209,11 @@ func handleChannels() {
 		case e := <-TaskErrorCh:
 			TasksMux.Lock()
 			task := Tasks[e.AppID][e.TaskID]
+			if task == nil {
+				ChanLog.Printf("%s TaskErrorCh: task[%d][%s] is nil", EmoWarning, e.AppID, e.TaskID)
+				continue
+			}
+
 			if task.Status == "cancelled" {
 				delete(Tasks[e.AppID], e.TaskID)
 				TasksMux.Unlock()
@@ -187,13 +230,19 @@ func handleChannels() {
 			task.Status = "error"
 			TasksMux.Unlock()
 			ChanLog.Printf("%s in %s (%s): %v\n", EmoError, task.TaskType, task.TaskID, e.Error)
-		case k := <-TaskCancelCh:
+
+		case c := <-TaskCancelCh:
 			TasksMux.Lock()
-			task := Tasks[k.AppID][k.TaskID]
+			task := Tasks[c.AppID][c.TaskID]
+			if task == nil {
+				ChanLog.Printf("%s TaskCancelCh: task[%d][%s] is nil", EmoWarning, c.AppID, c.TaskID)
+				continue
+			}
+
 			task.Status = "cancelled"
 			task.Cancel()
 			TasksMux.Unlock()
-			ChanLog.Printf("%s %s (%s), reason: %s\n", EmoCancel, task.TaskType, task.TaskID, k.Reason)
+			ChanLog.Printf("%s %s (%s), reason: %s\n", EmoCancel, task.TaskType, task.TaskID, c.Reason)
 		}
 	}
 }
@@ -205,14 +254,32 @@ func main() {
 	proxy_which := flag.String("proxy_which", "SYSTEM", "proxy to use")        // possible values: "SYSTEM", "NONE", "CUSTOM"
 	proxy_address := flag.String("proxy_address", "", "proxy address")
 	trusted_ca_certs := flag.String("trusted_ca_certs", "", "trusted CA certificates")
-	addon_version := flag.String("version", "", "addon version")
+	StartingAddonVersion = flag.String("version", "", "version of the add-on which starts the Client")
+	StartingSoftwareName = flag.String("software", "", "name of the software whose add-on starts the Client")
+	StartingPID = flag.String("pid", "", "PID of the process (running software) whose add-on starts the Client")
 	flag.Parse()
+
 	fmt.Print("\n\n")
-	BKLog.Printf("BlenderKit-Client v%s starting from add-on v%s\n   port=%s\n   server=%s\n   proxy_which=%s\n   proxy_address=%s\n   trusted_ca_certs=%s\n   ssl_context=%s",
-		ClientVersion, *addon_version, *Port, *Server, *proxy_which, *proxy_address, *trusted_ca_certs, *ssl_context)
+	startMessage := fmt.Sprintf("BlenderKit-Client v%s ", ClientVersion)
+	if *StartingAddonVersion == "" { // manual start - we could also check StartingSoftwareName
+		startMessage += "started manually"
+	} else { // proper start from Blender or other add-on
+		startMessage += fmt.Sprintf("started from %v add-on v%s", *StartingSoftwareName, *StartingAddonVersion)
+	}
+	startMessage += fmt.Sprintf(`
+	port=%s
+	server=%s
+	proxy_which=%s
+	proxy_address=%s
+	trusted_ca_certs=%s
+	ssl_context=%s
+	pid=%s`,
+		*Port, *Server, *proxy_which, *proxy_address, *trusted_ca_certs, *ssl_context, *StartingPID)
+	BKLog.Print(startMessage)
 
 	CreateHTTPClients(*proxy_address, *proxy_which, *ssl_context, *trusted_ca_certs)
 	go monitorReportAccess()
+	go monitorAvailableSoftwares()
 	go handleChannels()
 
 	mux := http.NewServeMux()
@@ -256,17 +323,26 @@ func main() {
 	mux.HandleFunc("/wrappers/blocking_request", BlockingRequestHandler)
 	mux.HandleFunc("/wrappers/nonblocking_request", NonblockingRequestHandler)
 
+	// WEB BROWSER - bkclient.js
+	mux.HandleFunc("/bkclientjs/status", bkclientjsStatusHandler)
+	mux.HandleFunc("/bkclientjs/get_asset", bkclientjsGetAssetHandler)
+
+	// OTHER SOFTWARES
+	mux.HandleFunc("/godot/report", godotReportHandler)
+
 	StartClient(mux)
 }
 
 // Start Client server on localhost, if this address cannot be used then it falls back to IPv4 127.0.0.1.
+// Function starts server and runs forever. If there is an error, it calls sys.exit().
 func StartClient(mux *http.ServeMux) {
 	var addrs = []string{
 		fmt.Sprintf("localhost:%s", *Port),
 		fmt.Sprintf("127.0.0.1:%s", *Port),
 	}
+	var err error
 	for i, addr := range addrs {
-		err := http.ListenAndServe(addr, mux)
+		err = http.ListenAndServe(addr, mux)
 		if err == nil {
 			BKLog.Printf("%s Server finished %s\n", EmoOK, addr)
 			return
@@ -278,8 +354,32 @@ func StartClient(mux *http.ServeMux) {
 		} else {
 			emo = EmoError
 		}
-		BKLog.Printf("%s Failed to start Client server on %s: %v\n", emo, addr, err)
+		BKLog.Printf("%s Failed to start Client server on %s: %v (%T)\n", emo, addr, err, err)
 	}
+
+	// HANDLE ERROR - be detailed here so we can signal problem to add-on via Return Code
+
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "listen" {
+		if sysErr, ok := opErr.Err.(*os.SyscallError); ok {
+			BKLog.Printf("*os.SyscallError: %v (%T)\n", sysErr, sysErr)
+			if sysErr.Err == syscall.EADDRINUSE {
+				BKLog.Printf("- syscall.EADDRINUSE: %v %T\n", sysErr, sysErr)
+				os.Exit(rcServerStartSyscallEADDRINUSE)
+			}
+			if sysErr.Err == syscall.EACCES {
+				BKLog.Printf("- syscall.EACCES: %v %T\n", sysErr, sysErr)
+				os.Exit(rcServerStartOtherNetworkingError)
+			}
+			BKLog.Printf("- other syscall error: %v\n", sysErr.Err)
+			os.Exit(rcServerStartOtherSyscallError)
+		}
+		BKLog.Printf("Other network error: %v (%T)\n", opErr.Err, opErr.Err)
+		os.Exit(rcServerStartOtherNetworkingError)
+	}
+
+	BKLog.Printf("Other error: %v\n", err)
+	os.Exit(rcServerStartOtherError)
 }
 
 func monitorReportAccess() {
@@ -294,16 +394,13 @@ func monitorReportAccess() {
 	}
 }
 
-func indexHandler(w http.ResponseWriter, r *http.Request) {
-	pid := os.Getpid()
-	fmt.Fprintf(w, "%d", pid)
-}
-
 func shutdownHandler(w http.ResponseWriter, r *http.Request) {
 	go delayedExit(0.1)
 	w.WriteHeader(http.StatusOK)
 }
 
+// Handles report for subscribed Blender add-ons.
+// TODO: reject unsupported versions of the add-on.
 func reportHandler(w http.ResponseWriter, r *http.Request) {
 	lastReportAccessMux.Lock()
 	lastReportAccess = time.Now()
@@ -330,6 +427,14 @@ func reportHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, msg, http.StatusForbidden) // 403
 		return
 	}
+
+	software := Software{
+		AppID:        data.AppID,
+		Name:         blender,
+		Version:      data.BlenderVersion,
+		AddonVersion: data.AddonVersion,
+	}
+	updateAvailableSoftware(software)
 
 	TasksMux.Lock()
 	if Tasks[data.AppID] == nil { // New add-on connected
@@ -365,11 +470,9 @@ func reportHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // SubscribeNewApp adds new App into Tasks[AppID].
-// This is called when new AppID appears - meeaning new add-on or other app wants to communicate with Client.
+// This is called when new AppID appears - meaning new add-on or other app wants to communicate with Client.
 func SubscribeNewApp(data MinimalTaskData) {
-	BKLog.Printf("%s New add-on connected: %d", EmoNewConnection, data.AppID)
 	Tasks[data.AppID] = make(map[string]*Task)
-
 	go FetchDisclaimer(data)
 	go FetchCategories(data)
 	if data.APIKey != "" {
@@ -411,7 +514,7 @@ func blenderUnsubscribeAddonHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error parsing JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	BKLog.Printf("%s Add-on unsubscribed: %d", EmoDisconnecting, data.AppID)
+	BKLog.Printf("%s Blender add-on unsubscribed: %d", EmoDisconnecting, data.AppID)
 
 	TasksMux.Lock()
 	if Tasks[data.AppID] != nil {
@@ -422,10 +525,15 @@ func blenderUnsubscribeAddonHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	TasksMux.Unlock()
 
-	if len(Tasks) == 0 {
+	// Remove from AvailableSoftwares so Client shutdowns correctly
+	AvailableSoftwaresMux.Lock()
+	delete(AvailableSoftwares, data.AppID)
+	if len(AvailableSoftwares) == 0 {
 		BKLog.Printf("%s No add-ons left, shutting down...", EmoWarning)
 		go delayedExit(0.1)
 	}
+	AvailableSoftwaresMux.Unlock()
+
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -853,7 +961,7 @@ func GetDownloadURLWrapper(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	canDownload, URL, err := GetDownloadURL(data)
+	canDownload, URL, err := GetDownloadURL(data.SceneID, data.Files, data.PREFS.Resolution, data.APIKey, data.AddonVersion, data.PlatformVersion)
 	if err != nil {
 		http.Error(w, "Error getting download URL: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -1049,7 +1157,6 @@ func GetRatingHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetRating is a function for fetching the rating of the asset.
-// Re-implements: file://daemon/daemon_ratings.py : get_rating()
 func GetRating(data GetRatingData) {
 	url := fmt.Sprintf("%s/api/v1/assets/%s/rating/", *Server, data.AssetID)
 	taskUUID := uuid.New().String()
@@ -1162,11 +1269,16 @@ func SendRating(data SendRatingData) {
 			TaskErrorCh <- &TaskError{AppID: data.AppID, TaskID: taskUUID, Error: err}
 			return
 		}
-
+		var msg string
+		if data.RatingType == "bookmarks" {
+			msg = "Bookmark removal successful"
+		} else {
+			msg = fmt.Sprintf("Removed %s rating successfully", data.RatingType)
+		}
 		TaskFinishCh <- &TaskFinish{
 			AppID:   data.AppID,
 			TaskID:  taskUUID,
-			Message: fmt.Sprintf("Removed %s rating successfully", data.RatingType),
+			Message: msg,
 			Result:  map[string]string{},
 		}
 		return
@@ -1192,11 +1304,17 @@ func SendRating(data SendRatingData) {
 		TaskErrorCh <- &TaskError{AppID: data.AppID, TaskID: taskUUID, Error: err}
 		return
 	}
+	var msg string
+	if data.RatingType == "bookmarks" {
+		msg = "Bookmarked successfully"
+	} else {
+		msg = fmt.Sprintf("Rated %s=%.1f successfully", data.RatingType, data.RatingValue)
+	}
 
 	TaskFinishCh <- &TaskFinish{
 		AppID:   data.AppID,
 		TaskID:  taskUUID,
-		Message: fmt.Sprintf("Rated %s=%.1f successfully", data.RatingType, data.RatingValue),
+		Message: msg,
 		Result:  respData,
 	}
 }
@@ -2317,4 +2435,426 @@ func DictToParams(inputs map[string]interface{}) []map[string]string {
 		parameters = append(parameters, param)
 	}
 	return parameters
+}
+
+// Browser (via bkclient-js) gets status of the Client and all connected softwares.
+func bkclientjsStatusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	data := ClientStatus{
+		ClientVersion: ClientVersion,
+		Softwares:     GetAvailableSoftwares(AvailableSoftwares),
+	}
+	jsonBytes, err := json.Marshal(data)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write(jsonBytes)
+}
+
+// Status report for the bkclientjs library. Contains information about
+// compatible software and its currently running instances.
+type ClientStatus struct {
+	ClientVersion string     `json:"clientVersion"`
+	Softwares     []Software `json:"softwares"`
+}
+
+// Connected and running compatible software.
+// Right now this can be just instance of Blender.
+type Software struct {
+	Name         string `json:"name"`         // Name of the software
+	Version      string `json:"version"`      // Version of the Software
+	AppID        int    `json:"appID"`        // PID of the process
+	AddonVersion string `json:"addonVersion"` // Version of the add-on
+	AssetsPath   string `json:"assetsPath"`   // Where to download assets, only for non-Blender add-ons
+
+	lastTimeConnected time.Time // To handle unsubscribe in softwares which does not allow it
+}
+
+// Data needed from the browser (with bkclientjs lib) to ask for Download of an asset.
+type bkclientjsDownloadData struct {
+	AssetID     string `json:"asset_id"`      // With ID client can directly get asset data on api/v1/assets
+	AssetBaseID string `json:"asset_base_id"` // Unused now. With Base ID add-on can search for the asset on api/v1/search
+	Resolution  string `json:"resolution"`    // Selected resolution - we ideally wants the user to decide on the web
+	APIKey      string `json:"api_key"`       // APIKey to be used (user is logged in on the web, so Client/addon can use this)
+	AppID       int    `json:"app_id"`        // AppID (PID) of the software to which we will download - detailed data in AvailableSoftwares
+}
+
+// User has clicked on Get This Model, or another words browser (via bkclientjs)
+// orders the Client to download the specified asset to specified software.
+func bkclientjsGetAssetHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	if r.Method == http.MethodOptions {
+		// The browser performs what is called a "preflight" request using the OPTIONS method
+		// to check if the actual request is safe to send. This preflight request is part of the CORS protocol
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	var data bkclientjsDownloadData
+	err := json.NewDecoder(r.Body).Decode(&data)
+	if err != nil {
+		fmt.Println(err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	targetSoftware, exists := AvailableSoftwares[data.AppID]
+	if !exists {
+		BKLog.Printf("%s Could not find software (appID %d) for JS download", EmoWarning, data.AppID)
+		w.WriteHeader(http.StatusExpectationFailed)
+		w.Write([]byte("Software not Found"))
+		return
+	}
+
+	BKLog.Printf("%s Get Asset to %s (%d): %s %s, %s", EmoBKClientJS, targetSoftware.Name, data.AppID, data.AssetID, data.AssetBaseID, data.Resolution)
+	go bkclientjsGetAsset(data.AppID, data.APIKey, data.AssetBaseID, data.AssetID, data.Resolution, targetSoftware)
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
+type GetThisModelData struct {
+	ApiKey      string `json:"api_key"`
+	AssetID     string `json:"asset_id"`
+	AssetBaseID string `json:"asset_base_id"`
+	Resolution  string `json:"resolution"`
+	AssetData   Asset  `json:"asset_data"`
+}
+
+func bkclientjsGetAsset(appID int, apiKey, assetBaseID, assetID, resolution string, targetSoftware Software) {
+	assetData, err := GetAssetInstance(assetID) // TODO: use assetBaseID and get the asset via /api/v1/search as advised by Petr
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	// BLENDER -> send data to add-on, it will then make a search and ask for download
+	if targetSoftware.Name == blender {
+		AddTaskCh <- &Task{
+			AppID:    appID,
+			TaskID:   uuid.New().String(),
+			TaskType: "bkclientjs/get_asset",
+			Message:  "Download requested from browser.",
+			Status:   "finished",
+			Result: GetThisModelData{
+				ApiKey:      apiKey,
+				AssetID:     assetID,
+				AssetBaseID: assetBaseID,
+				Resolution:  resolution,
+				AssetData:   assetData,
+			},
+		}
+		return
+	}
+
+	// OTHER SOFTWARES
+	sceneID := uuid.New().String()
+	// TODO: Here we need to define
+	canDownload, downloadURL, err := GetDownloadURL(sceneID, assetData.Files, resolution, apiKey, targetSoftware.AddonVersion, "")
+	if err != nil {
+		BKLog.Printf("%s GetDownloadURL error %v", EmoBKClientJS, err)
+		return
+	}
+	if !canDownload {
+		BKLog.Println("Cannot download asset")
+		return
+	}
+
+	// TODO: Here we need to define human readable name for GLTF
+	fileName, err := ExtractFilenameFromURL(downloadURL)
+	fileName = fileName + ".gltf" // HACK just for presentation
+	if err != nil {
+		BKLog.Printf("%s ExtractFilenameFromURL error %v", EmoBKClientJS, err)
+		return
+	}
+
+	downloadDir := filepath.Join(targetSoftware.AssetsPath, assetData.AssetType)
+	if _, err := os.Stat(downloadDir); os.IsNotExist(err) {
+		os.MkdirAll(downloadDir, os.ModePerm)
+	}
+
+	downloadPath := filepath.Join(downloadDir, fileName)
+	fmt.Println("download path:", downloadPath)
+
+	exists, info, err := FileExists(downloadPath)
+	if err != nil {
+		if info.IsDir() {
+			fmt.Println("Deleting directory:", downloadPath)
+			err := os.RemoveAll(downloadPath)
+			if err != nil {
+				fmt.Println("Error deleting directory:", err)
+			}
+		} else {
+			fmt.Println("Error checking if file exists:", err)
+		}
+	}
+	if exists {
+		fmt.Printf("file %s exists", downloadPath)
+		return
+	}
+
+	file, err := os.Create(downloadPath)
+	if err != nil {
+		fmt.Println("error creating file", err)
+		return
+	}
+	defer file.Close()
+	fmt.Println("-> file has been created")
+
+	req, err := http.NewRequest("GET", downloadURL, nil)
+	if err != nil {
+		fmt.Println("Error creating request:", err)
+		return
+	}
+	req.Header = getHeaders("", *SystemID, targetSoftware.AddonVersion, "")
+	fmt.Println("-> making the request")
+	resp, err := ClientDownloads.Do(req)
+	if err != nil {
+		e := DeleteFile(downloadPath)
+		if e != nil {
+			fmt.Printf("request failed: %v, failed to delete file: %v", err, e)
+			return
+		}
+		fmt.Printf("request failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		_, respString, _ := ParseFailedHTTPResponse(resp)
+		err := fmt.Errorf("server returned non-OK status (%d): %s", resp.StatusCode, respString)
+		e := DeleteFile(downloadPath)
+		if e != nil {
+			fmt.Printf("%v, failed to delete file: %v", err, e)
+			return
+		}
+		fmt.Println(err)
+	}
+
+	totalLength := resp.Header.Get("Content-Length")
+	if totalLength == "" {
+		e := DeleteFile(downloadPath)
+		if e != nil {
+			fmt.Printf("request failed: %v, failed to delete file: %v", err, e)
+			return
+		}
+		fmt.Println("Content-Length header is missing")
+		return
+	}
+
+	fileSize, err := strconv.ParseInt(totalLength, 10, 64)
+	if err != nil {
+		e := DeleteFile(downloadPath)
+		if e != nil {
+			fmt.Printf("length conversion failed: %v, failed to delete file: %v", err, e)
+			return
+		}
+		fmt.Println(err)
+		return
+	}
+
+	// Setup for monitoring progress and cancellation
+	sizeInMB := float64(fileSize) / 1024 / 1024
+	var downloaded int64 = 0
+	progress := make(chan int64)
+	go func() {
+		var downloadMessage string
+		for p := range progress {
+			progress := int(100 * p / fileSize)
+			if sizeInMB < 1 { // If the size is less than 1MB, show in KB
+				downloadMessage = fmt.Sprintf("Downloading %dkB (%d%%)", int(sizeInMB*1024), progress)
+			} else { // If the size is not a whole number, show one decimal place
+				downloadMessage = fmt.Sprintf("Downloading %.1fMB (%d%%)", sizeInMB, progress)
+			}
+			fmt.Println(downloadMessage)
+		}
+	}()
+
+	buffer := make([]byte, 32*1024) // 32KB buffer
+	for {
+		n, readErr := resp.Body.Read(buffer)
+		if n > 0 {
+			_, writeErr := file.Write(buffer[:n])
+			if writeErr != nil {
+				close(progress)
+				err = DeleteFile(downloadPath) // Clean up; ignore error from DeleteFile to focus on writeErr
+				if err != nil {
+					fmt.Printf("%v, failed to delete file: %v", writeErr, err)
+					return
+				}
+				fmt.Print("writeErr", writeErr)
+				return
+			}
+			downloaded += int64(n)
+			progress <- downloaded
+		}
+		if readErr != nil {
+			close(progress)
+			if readErr == io.EOF {
+				fmt.Println("Download completed successfully")
+				return // Download completed successfully
+			}
+			err := DeleteFile(downloadPath) // Clean up; ignore error from DeleteFile to focus on readErr
+			if err != nil {
+				fmt.Printf("%v, failed to delete file: %v", readErr, err)
+				return
+			}
+			fmt.Println("readErr", readErr)
+			return
+		}
+	}
+}
+
+// Get data for single Asset instance by assetID.
+// https://www.blenderkit.com/api/v1/assets/{assetID}/
+// TODO: use assetBaseID and get the asset via /api/v1/search as advised by Petr
+func GetAssetInstance(assetID string) (Asset, error) {
+	data := Asset{}
+	url := fmt.Sprintf("%s/api/v1/assets/%s/", *Server, assetID)
+	resp, err := http.Get(url)
+	if err != nil {
+		return data, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		msg := "error getting asset"
+		respJSON, respString, err := ParseFailedHTTPResponse(resp)
+		if err != nil || respJSON == nil {
+			return data, fmt.Errorf("%s (%s): failed parsing error response (%v), [URL: %v]", msg, resp.Status, respString, url)
+		}
+		return data, fmt.Errorf("%s (%s)", msg, resp.Status)
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return data, err
+	}
+
+	return data, nil
+}
+
+// Get AvailableSoftwares as a slice.
+func GetAvailableSoftwares(softwareMap map[int]Software) []Software {
+	var softwares []Software
+	for i := range softwareMap {
+		softwares = append(softwares, softwareMap[i])
+	}
+
+	return softwares
+}
+
+// Monitor AvailableSoftwares (connected Blender, Godot, etc) for those which are inactive for defined period of time.
+// If they are found to be inactive, function removes them from the AvailableSoftwares map and if it was last software there
+// we shutdown the Client. We handle removal/unsubscription via checking lastTimeConected because not all softwares are able
+// to send Request during unregistration/closing of the host software.
+func monitorAvailableSoftwares() {
+	pause := 250 * time.Millisecond
+	tolerance := 999 * time.Millisecond
+	for {
+		time.Sleep(pause)
+		AvailableSoftwaresMux.Lock()
+		now := time.Now()
+		for i := range AvailableSoftwares {
+			software := AvailableSoftwares[i]
+			if now.Sub(software.lastTimeConnected) < tolerance {
+				continue // Software is active
+			}
+			if software.Name == blender {
+				// Blender add-on unsubscribes itself, so we them remove only in extreme cases
+				if now.Sub(software.lastTimeConnected) < 120*time.Second {
+					continue
+				}
+			}
+
+			// Software found to be inactive
+			delete(AvailableSoftwares, software.AppID)
+			BKLog.Printf("%s %s unsubscribed: %d", EmoDisconnecting, software.Name, software.AppID)
+
+			// Software removed and nothing is left. We shutdown Client. We do not check outside for
+			// as it could shutdown Client right after start, as availableSoftware is filled on first reports request.
+			if len(AvailableSoftwares) == 0 {
+				BKLog.Printf("%s No add-ons left, shutting down...", EmoWarning)
+				go delayedExit(0.1)
+			}
+		}
+		AvailableSoftwaresMux.Unlock()
+	}
+}
+
+// When software sends data to Client, we want to update the details in AvailableSoftwares map.
+// Especially we want to update the lastTimeConnected, because this time parameter is used to
+// monitor active and inactive softwares in order to unsubscribe them.
+func updateAvailableSoftware(data Software) bool {
+	new := false
+	if _, ok := AvailableSoftwares[data.AppID]; !ok { // New add-on connected
+		BKLog.Printf("%s %s (v%s, add-on v%s) subscribed: %d", EmoNewConnection, data.Name, data.Version, data.AddonVersion, data.AppID)
+		new = true
+	}
+
+	data.lastTimeConnected = time.Now()
+	AvailableSoftwaresMux.Lock()
+	AvailableSoftwares[data.AppID] = data
+	AvailableSoftwaresMux.Unlock()
+
+	return new
+}
+
+// General response data to non-Blender softwares.
+type SoftwareResponse struct {
+	ClientVersion string `json:"client_version"`
+	Message       string `json:"message"`       // What to show to user
+	MessageLevel  int    `json:"message_level"` // 0=Debug, 10=Info, 20=Warning, 30=Error, 40=Fatal
+}
+
+func godotReportHandler(w http.ResponseWriter, r *http.Request) {
+	lastReportAccessMux.Lock()
+	lastReportAccess = time.Now()
+	lastReportAccessMux.Unlock()
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Error reading search request body: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer r.Body.Close()
+
+	var data Software
+	err = json.Unmarshal(body, &data)
+	if err != nil {
+		http.Error(w, "Error parsing JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	new := updateAvailableSoftware(data)
+	var response SoftwareResponse
+	if new {
+		response = SoftwareResponse{
+			ClientVersion: ClientVersion,
+			Message:       "Connected to Client",
+			MessageLevel:  10,
+		}
+	} else {
+		response = SoftwareResponse{
+			ClientVersion: ClientVersion,
+			Message:       "",
+			MessageLevel:  0,
+		}
+	}
+
+	responseJSON, err := json.Marshal(response)
+	if err != nil {
+		http.Error(w, "Error converting to JSON: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	BKLog.Printf("%s %s (v%s, %d) add-on(v%s) report: assetsPath=%s", EmoInfo, data.Name, data.Version, data.AppID, data.AddonVersion, data.AssetsPath)
+	w.WriteHeader(http.StatusOK)
+	w.Write(responseJSON)
 }
