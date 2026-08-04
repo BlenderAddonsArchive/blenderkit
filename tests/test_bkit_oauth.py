@@ -115,3 +115,78 @@ class TestOAuthLoginURL(unittest.TestCase):
 
         query = parse_qs(urlsplit(open_new_tab.call_args.args[0]).query)
         self.assertEqual(query["utm_content"], ["premium_popup"])
+
+
+class TestLoginTelemetry(unittest.TestCase):
+    def test_login_reports_started_event_with_placement(self):
+        with (
+            mock.patch.object(global_vars, "SERVER", "https://example.com"),
+            mock.patch.object(bkit_oauth.client_lib, "get_port", return_value="12345"),
+            mock.patch.object(
+                bkit_oauth, "generate_pkce_pair", return_value=("verifier", "challenge")
+            ),
+            mock.patch.object(
+                bkit_oauth.secrets, "token_urlsafe", return_value="state-token"
+            ),
+            mock.patch.object(
+                bkit_oauth, "get_system_id", return_value="000000000000123"
+            ),
+            mock.patch.object(bkit_oauth.client_lib, "send_oauth_verification_data"),
+            mock.patch.object(bkit_oauth, "open_new_tab", return_value=True),
+            mock.patch.object(bkit_oauth.client_lib, "report_event") as report_event,
+        ):
+            bkit_oauth.login(signup=True, placement="premium_popup")
+
+        report_event.assert_called_once_with(
+            "login_started", {"placement": "premium_popup", "signup": True}
+        )
+
+    def test_cancel_reports_cancelled_event(self):
+        with mock.patch.object(bkit_oauth.client_lib, "report_event") as report_event:
+            bpy.ops.wm.blenderkit_login_cancel()
+
+        report_event.assert_called_once_with("login_cancelled")
+
+    def test_finished_login_task_reports_completed(self):
+        task = mock.Mock()
+        task.status = "finished"
+        task.result = {"access_token": "at", "refresh_token": "rt"}
+        with (
+            mock.patch.object(bkit_oauth.tasks_queue, "add_task") as add_task,
+            mock.patch.object(bkit_oauth.client_lib, "report_event") as report_event,
+        ):
+            bkit_oauth.handle_login_task(task)
+
+        report_event.assert_called_once_with("login_completed")
+        add_task.assert_called_once()
+
+    def test_error_login_task_reports_failed_with_message(self):
+        task = mock.Mock()
+        task.status = "error"
+        task.message = "Server is down"
+        task.message_detailed = "details"
+        with (
+            mock.patch.object(bkit_oauth, "logout") as logout,
+            mock.patch.object(bkit_oauth.reports, "add_report"),
+            mock.patch.object(bkit_oauth.client_lib, "report_event") as report_event,
+        ):
+            bkit_oauth.handle_login_task(task)
+
+        report_event.assert_called_once_with(
+            "login_failed", {"message": "Server is down"}
+        )
+        logout.assert_called_once()
+
+    def test_token_refresh_does_not_report_login_completed(self):
+        """write_tokens is shared with token refresh - the event must live in
+        handle_login_task only, or every refresh would count as a login."""
+        with (
+            mock.patch.object(bkit_oauth, "bpy") as bpy_mock,
+            mock.patch.object(bkit_oauth.search_price, "clear_price_cache"),
+            mock.patch.object(bkit_oauth.client_lib, "report_event") as report_event,
+        ):
+            # below the 4.2 extensions branch, which needs a real repo setup
+            bpy_mock.app.version = (3, 6, 0)
+            bkit_oauth.write_tokens("at", "rt", {"expires_in": 3600})
+
+        report_event.assert_not_called()
